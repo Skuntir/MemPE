@@ -47,6 +47,31 @@ struct ParsedExports {
     forwarders: Vec<ForwardedExport>,
 }
 
+struct Definitions {
+    by_module: HashMap<(String, ExportKey), usize>,
+    unique_by_key: HashMap<ExportKey, Option<usize>>,
+}
+
+impl Definitions {
+    fn build(by_module: HashMap<(String, ExportKey), usize>) -> Self {
+        let mut unique_by_key = HashMap::<ExportKey, Option<usize>>::with_capacity(by_module.len());
+        for ((_, key), address) in &by_module {
+            unique_by_key
+                .entry(key.clone())
+                .and_modify(|known| {
+                    if *known != Some(*address) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(*address));
+        }
+        Self {
+            by_module,
+            unique_by_key,
+        }
+    }
+}
+
 impl ExportIndex {
     pub(crate) fn build<'a>(
         images: impl IntoIterator<Item = (usize, &'a [u8], Option<&'a str>)>,
@@ -68,7 +93,7 @@ impl ExportIndex {
         }
 
         index.stats.forwarders = forwarders.len();
-        resolve_forwarders(&mut index, &definitions, &forwarders);
+        resolve_forwarders(&mut index, &Definitions::build(definitions), &forwarders);
         index.stats.addresses = index.addresses.len();
         index
     }
@@ -181,7 +206,7 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
 
 fn resolve_forwarders(
     index: &mut ExportIndex,
-    definitions: &HashMap<(String, ExportKey), usize>,
+    definitions: &Definitions,
     forwarders: &[ForwardedExport],
 ) {
     let mut pending = HashMap::<(String, ExportKey), &ForwardedExport>::new();
@@ -218,29 +243,21 @@ fn resolve_forwarders(
 fn resolve_key(
     module: &str,
     key: &ExportKey,
-    definitions: &HashMap<(String, ExportKey), usize>,
+    definitions: &Definitions,
     pending: &HashMap<(String, ExportKey), &ForwardedExport>,
 ) -> Option<usize> {
     let mut module = normalize_module(module).to_ascii_lowercase();
     let mut key = key.clone();
     for _hop in 0..MAX_FORWARD_DEPTH {
         let lookup = (module.clone(), key.clone());
-        if let Some(address) = definitions.get(&lookup) {
+        if let Some(address) = definitions.by_module.get(&lookup) {
             return Some(*address);
         }
         if is_api_set(&module) {
-            let mut match_address = None;
-            for ((_, candidate_key), address) in definitions {
-                if candidate_key != &key {
-                    continue;
-                }
-                if match_address.is_some_and(|known| known != *address) {
-                    return None;
-                }
-                match_address = Some(*address);
-            }
-            if match_address.is_some() {
-                return match_address;
+            match definitions.unique_by_key.get(&key) {
+                Some(Some(address)) => return Some(*address),
+                Some(None) => return None,
+                None => {}
             }
         }
         let next = pending.get(&lookup)?;
@@ -313,12 +330,36 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_forward_target;
+    use std::collections::HashMap;
+
+    use super::{Definitions, ExportKey, parse_forward_target};
 
     #[test]
     fn parses_named_and_ordinal_forwarders() {
         assert!(parse_forward_target("KERNELBASE.CreateFileW").is_some());
         assert!(parse_forward_target("NTDLL.#42").is_some());
         assert!(parse_forward_target("broken").is_none());
+    }
+
+    #[test]
+    fn keeps_only_unambiguous_addresses_per_key() {
+        let by_module = HashMap::from([
+            (("a.dll".to_owned(), ExportKey::Ordinal(1)), 0x10),
+            (("b.dll".to_owned(), ExportKey::Ordinal(1)), 0x10),
+            (("a.dll".to_owned(), ExportKey::Ordinal(2)), 0x20),
+            (("b.dll".to_owned(), ExportKey::Ordinal(2)), 0x30),
+        ]);
+
+        let definitions = Definitions::build(by_module);
+
+        assert_eq!(
+            definitions.unique_by_key.get(&ExportKey::Ordinal(1)),
+            Some(&Some(0x10))
+        );
+        assert_eq!(
+            definitions.unique_by_key.get(&ExportKey::Ordinal(2)),
+            Some(&None)
+        );
+        assert_eq!(definitions.unique_by_key.get(&ExportKey::Ordinal(3)), None);
     }
 }

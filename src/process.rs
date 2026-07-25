@@ -199,14 +199,11 @@ fn find_new_target(
     current: &HashSet<ProcessId>,
     baseline: &HashSet<ProcessId>,
 ) -> Option<TargetProcess> {
-    let mut candidates = Vec::with_capacity(current.len().min(16));
-    for pid in current.difference(baseline).take(MAX_PROCESSES) {
-        if let Ok(target) = query(*pid) {
-            candidates.push(target);
-        }
-    }
-    candidates.sort_by_key(|target| (target.created, target.pid.get()));
-    candidates.into_iter().next()
+    current
+        .difference(baseline)
+        .take(MAX_PROCESSES)
+        .filter_map(|pid| query(*pid).ok())
+        .min_by_key(|target| (target.created, target.pid.get()))
 }
 
 fn wait_until_capture_time(created: u64) {

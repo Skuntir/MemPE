@@ -167,7 +167,7 @@ pub(crate) fn rebuild(
     let import_plan = build_plan(&image, observed_base, exports);
     if !import_plan.groups.is_empty() {
         append_import_section(&mut output, model, &import_plan)?;
-    } else if !import_plan.existing_valid {
+    } else if import_plan.existing.is_empty() {
         cleared_directories = clear_directory(&mut output, model, IMPORT_DIRECTORY)?
             .saturating_add(cleared_directories);
     }
@@ -678,7 +678,10 @@ fn runtime_function_is_valid(
     let Ok(unwind) = read_u32(entry, 8) else {
         return false;
     };
-    if begin >= end || !model.executable_rva(Rva(begin)) || !model.executable_rva(Rva(end - 1)) {
+    if begin >= end
+        || !model.executable_rva(Rva(begin))
+        || !model.executable_rva(Rva(end.saturating_sub(1)))
+    {
         return false;
     }
     let Some(unwind_offset) = rva_to_file(unwind, layouts, header_size) else {
@@ -780,13 +783,8 @@ fn append_import_section(
         model.size_of_image_offset,
         u32::try_from(image_size).map_err(|_| AppError::new("image size exceeds u32"))?,
     )?;
-    let descriptor_size = plan
-        .groups
-        .len()
-        .checked_add(1)
-        .and_then(|count| count.checked_mul(IMPORT_DESCRIPTOR_SIZE))
-        .and_then(|size| u32::try_from(size).ok())
-        .ok_or_else(|| AppError::new("import descriptor size overflowed"))?;
+    let descriptor_size = u32::try_from(import_descriptor_bytes(plan)?)
+        .map_err(|_| AppError::new("import descriptor size exceeds u32"))?;
     write_directory(
         output,
         model,
@@ -800,13 +798,8 @@ fn append_import_section(
 
 fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> AppResult<Vec<u8>> {
     let width = if kind == PeKind::Pe32 { 4 } else { 8 };
-    let descriptor_bytes = plan
-        .groups
-        .len()
-        .checked_add(1)
-        .and_then(|count| count.checked_mul(IMPORT_DESCRIPTOR_SIZE))
-        .ok_or_else(|| AppError::new("import descriptor size overflowed"))?;
-    let mut payload = vec![0u8; descriptor_bytes];
+    let mut payload = plan.existing.clone();
+    payload.resize(import_descriptor_bytes(plan)?, 0);
     for (group_index, group) in plan.groups.iter().enumerate() {
         align_vec(&mut payload, width);
         let lookup_offset = payload.len();
@@ -841,7 +834,10 @@ fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> Ap
         }
         let module_offset = payload.len();
         append_ascii(&mut payload, &group.module)?;
-        let descriptor = group_index.saturating_mul(IMPORT_DESCRIPTOR_SIZE);
+        let descriptor = group_index
+            .checked_mul(IMPORT_DESCRIPTOR_SIZE)
+            .and_then(|offset| offset.checked_add(plan.existing.len()))
+            .ok_or_else(|| AppError::new("import descriptor offset overflowed"))?;
         write_u32(
             &mut payload,
             descriptor,
@@ -869,6 +865,15 @@ fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> Ap
         )?;
     }
     Ok(payload)
+}
+
+fn import_descriptor_bytes(plan: &ImportPlan) -> AppResult<usize> {
+    plan.groups
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(IMPORT_DESCRIPTOR_SIZE))
+        .and_then(|size| size.checked_add(plan.existing.len()))
+        .ok_or_else(|| AppError::new("import descriptor size overflowed"))
 }
 
 fn append_ascii(bytes: &mut Vec<u8>, value: &str) -> AppResult<()> {

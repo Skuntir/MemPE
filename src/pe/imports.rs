@@ -32,7 +32,7 @@ pub(super) struct ImportPlan {
     pub(super) groups: Vec<ImportGroup>,
     pub(super) recovered: usize,
     pub(super) ambiguous: usize,
-    pub(super) existing_valid: bool,
+    pub(super) existing: Vec<u8>,
 }
 
 pub(super) fn build_plan(
@@ -40,15 +40,23 @@ pub(super) fn build_plan(
     observed_base: usize,
     exports: &ExportIndex,
 ) -> ImportPlan {
+    let mut plan = ImportPlan::default();
+    match existing_descriptors(image) {
+        Some(existing) => plan.existing = existing,
+        None => scan_trusted_ranges(image, observed_base, exports, &mut plan),
+    }
+    recover_referenced_imports(image, observed_base, exports, &mut plan);
+    plan
+}
+
+fn scan_trusted_ranges(
+    image: &PeImage<'_>,
+    observed_base: usize,
+    exports: &ExportIndex,
+    plan: &mut ImportPlan,
+) {
     let memory = image.bytes();
     let model = image.model();
-    if existing_imports_are_valid(image) {
-        return ImportPlan {
-            existing_valid: true,
-            ..ImportPlan::default()
-        };
-    }
-    let mut plan = ImportPlan::default();
     let declared_iat = directory(image, IAT_DIRECTORY)
         .and_then(|(rva, size)| rva.checked_add(size).map(|end| (rva, end)));
     for section in model.sections() {
@@ -81,14 +89,12 @@ pub(super) fn build_plan(
             exports,
             start,
             end,
-            &mut plan,
+            plan,
         );
         if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
             break;
         }
     }
-    recover_referenced_imports(image, observed_base, exports, &mut plan);
-    plan
 }
 
 fn scan_import_range(
@@ -153,7 +159,8 @@ fn recover_referenced_imports(
     let memory = image.bytes();
     let kind = model.kind();
     let width = if kind == PeKind::Pe32 { 4 } else { 8 };
-    let recovered = collect_recovered_slots(plan, width);
+    let mut recovered = collect_recovered_slots(plan, width);
+    recovered.append(&mut existing_thunk_slots(memory, &plan.existing, width));
     let referenced = find_referenced_slots(image, observed_base);
     let remaining = MAX_IMPORTS.saturating_sub(plan.recovered);
     let mut entries = Vec::with_capacity(referenced.len().min(remaining));
@@ -263,6 +270,29 @@ fn slot_is_in_data_section(image: &PeImage<'_>, slot: u32, width: usize) -> bool
             && slot >= start
             && end <= section_end
     })
+}
+
+fn existing_thunk_slots(memory: &[u8], descriptors: &[u8], width: usize) -> BTreeSet<u32> {
+    let mut slots = BTreeSet::new();
+    for descriptor in descriptors.chunks_exact(IMPORT_DESCRIPTOR_SIZE) {
+        let Some(first_thunk) = read_u32(descriptor, 16) else {
+            continue;
+        };
+        for index in 0..MAX_IMPORTS {
+            let Some(slot) = index
+                .checked_mul(width)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .and_then(|offset| first_thunk.checked_add(offset))
+            else {
+                break;
+            };
+            match read_pointer(memory, slot as usize, width) {
+                None | Some(0) => break,
+                Some(_) => slots.insert(slot),
+            };
+        }
+    }
+    slots
 }
 
 fn collect_recovered_slots(plan: &ImportPlan, width: usize) -> BTreeSet<u32> {
@@ -404,47 +434,33 @@ fn decode_x86_thunk(memory: &[u8], base: usize, rva: usize) -> Option<usize> {
     None
 }
 
-fn existing_imports_are_valid(image: &PeImage<'_>) -> bool {
+fn existing_descriptors(image: &PeImage<'_>) -> Option<Vec<u8>> {
     let memory = image.bytes();
     let model = image.model();
-    let Some((directory_rva, directory_size)) = directory(image, IMPORT_DIRECTORY) else {
-        return false;
-    };
+    let (directory_rva, directory_size) = directory(image, IMPORT_DIRECTORY)?;
     if directory_size < IMPORT_DESCRIPTOR_SIZE as u32 {
-        return false;
+        return None;
     }
     let max_descriptors = (directory_size as usize / IMPORT_DESCRIPTOR_SIZE).min(MAX_IMPORT_GROUPS);
-    let mut found = false;
+    let mut descriptors = Vec::new();
     for index in 0..max_descriptors {
-        let Some(offset) =
-            (directory_rva as usize).checked_add(index.saturating_mul(IMPORT_DESCRIPTOR_SIZE))
-        else {
-            return false;
-        };
-        let Some(descriptor) = memory.get(offset..offset.saturating_add(IMPORT_DESCRIPTOR_SIZE))
-        else {
-            return false;
-        };
+        let offset =
+            (directory_rva as usize).checked_add(index.saturating_mul(IMPORT_DESCRIPTOR_SIZE))?;
+        let descriptor = memory.get(offset..offset.saturating_add(IMPORT_DESCRIPTOR_SIZE))?;
         if descriptor.iter().all(|byte| *byte == 0) {
-            return found;
+            return (!descriptors.is_empty()).then_some(descriptors);
         }
-        let Some(original_thunk) = read_u32(memory, offset) else {
-            return false;
-        };
-        let Some(name_rva) = read_u32(memory, offset + 12) else {
-            return false;
-        };
-        let Some(first_thunk) = read_u32(memory, offset + 16) else {
-            return false;
-        };
+        let original_thunk = read_u32(memory, offset)?;
+        let name_rva = read_u32(memory, offset.saturating_add(12))?;
+        let first_thunk = read_u32(memory, offset.saturating_add(16))?;
         if read_ascii(memory, name_rva as usize).is_none()
             || !thunk_table_is_valid(memory, model.kind(), original_thunk, first_thunk)
         {
-            return false;
+            return None;
         }
-        found = true;
+        descriptors.extend_from_slice(descriptor);
     }
-    false
+    None
 }
 
 fn thunk_table_is_valid(memory: &[u8], kind: PeKind, original: u32, first: u32) -> bool {
@@ -504,7 +520,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use pelite::PeFile;
 
-    use super::{build_plan, decode_slot_reference};
+    use super::{IMPORT_DESCRIPTOR_SIZE, build_plan, decode_slot_reference};
     use crate::pe::parse::parse_memory_image;
     use crate::pe::{ExportIndex, PeKind, rebuild};
 
@@ -576,6 +592,49 @@ mod tests {
 
         assert_eq!(plan.recovered, 0);
         assert!(plan.groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn merges_recovered_imports_with_a_valid_existing_table()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let target_base = 0x0000_7FF6_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        put_u32(&mut target, 0x98 + 112 + 8, 0x2100);
+        put_u32(&mut target, 0x98 + 112 + 12, 40);
+        put_u32(&mut target, 0x2100, 0x2200);
+        put_u32(&mut target, 0x2100 + 12, 0x2300);
+        put_u32(&mut target, 0x2100 + 16, 0x2400);
+        put_u64(&mut target, 0x2200, 0x2280);
+        put_u64(&mut target, 0x2400, export_base as u64 + 0x1010);
+        target[0x2282..0x228b].copy_from_slice(b"Existing\0");
+        target[0x2300..0x230a].copy_from_slice(b"other.dll\0");
+        put_u64(&mut target, 0x2500, export_base as u64 + 0x1000);
+        let fresh = 0x2500i32 - 0x1006i32;
+        target[0x1000..0x1002].copy_from_slice(&[0xFF, 0x15]);
+        target[0x1002..0x1006].copy_from_slice(&fresh.to_le_bytes());
+        let covered = 0x2400i32 - 0x1016i32;
+        target[0x1010..0x1012].copy_from_slice(&[0xFF, 0x15]);
+        target[0x1012..0x1016].copy_from_slice(&covered.to_le_bytes());
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, target_base, &index);
+
+        assert_eq!(plan.existing.len(), IMPORT_DESCRIPTOR_SIZE);
+        assert_eq!(plan.recovered, 1);
+        assert_eq!(plan.groups[0].first_thunk, 0x2500);
+
+        let rebuilt = rebuild(&target, &[], target_base, None, &index, None)?;
+        let modules = PeFile::from_bytes(&rebuilt.bytes)?
+            .imports()?
+            .into_iter()
+            .map(|descriptor| descriptor.dll_name().map(|name| name.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(modules, ["other.dll", "fixture.dll"]);
         Ok(())
     }
 

@@ -6,8 +6,8 @@ use crate::{AppError, AppResult};
 
 pub const HELP: &str = "mempe - Windows PE memory dumper and rebuilder\n\n\
 Usage:\n\
-  mempe.exe -p <PID> [--entry-point <RVA>]\n\
-  mempe.exe -w <program.exe> [--entry-point <RVA>]\n\
+  mempe.exe -p <PID> [-e|--entry-point <RVA>]\n\
+  mempe.exe -w <program.exe> [-e|--entry-point <RVA>]\n\
   mempe.exe -h\n";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -39,18 +39,19 @@ where
         return Ok(None);
     }
 
-    let value = args
-        .next()
-        .ok_or_else(|| AppError::new("this option needs a value"))?;
-    let command = if option == "-p" {
-        parse_pid(value).map(Command::Pid)?
-    } else if option == "-w" {
-        parse_watch_name(value).map(Command::Watch)?
-    } else {
+    if option != "-p" && option != "-w" {
         return Err(AppError::new(format!(
             "unknown option: {}",
             option.to_string_lossy()
         )));
+    }
+    let value = args
+        .next()
+        .ok_or_else(|| AppError::new(format!("{} needs a value", option.to_string_lossy())))?;
+    let command = if option == "-p" {
+        parse_pid(value).map(Command::Pid)?
+    } else {
+        parse_watch_name(value).map(Command::Watch)?
     };
     let entry_point = parse_entry_point_option(&mut args)?;
     Ok(Some(Request {
@@ -167,6 +168,13 @@ mod tests {
         assert!(matches!(request.command, Command::Pid(_)));
         assert_eq!(request.entry_point, crate::pe::EntryPointRva::new(0x31A20));
         Ok(())
+    }
+
+    #[test]
+    fn names_an_unknown_option_instead_of_asking_for_its_value() {
+        let error = parse(args(&["mempe", "--version"])).err();
+
+        assert!(error.is_some_and(|error| error.to_string().contains("--version")));
     }
 
     #[test]
