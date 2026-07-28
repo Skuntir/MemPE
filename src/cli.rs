@@ -8,7 +8,8 @@ pub const HELP: &str = "mempe - Windows PE memory dumper and rebuilder\n\n\
 Usage:\n\
   mempe.exe -p <PID> [-e|--entry-point <RVA>]\n\
   mempe.exe -w <program.exe> [-e|--entry-point <RVA>]\n\
-  mempe.exe -h\n";
+  mempe.exe -h\n\n\
+-w waits up to 24 hours for a new matching process. Press Ctrl+C to stop.\n";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Request {
@@ -64,7 +65,7 @@ fn parse_pid(value: OsString) -> AppResult<NonZeroU32> {
     let text = value
         .into_string()
         .map_err(|_| AppError::new("PID must use valid text"))?;
-    let parsed = parse_u32(&text).map_err(|_| AppError::new(format!("invalid PID: {text}")))?;
+    let parsed = parse_u32(&text).map_err(|_| AppError::new(format!("invalid PID: {text:?}")))?;
 
     NonZeroU32::new(parsed).ok_or_else(|| AppError::new("PID must be greater than zero"))
 }
@@ -103,8 +104,8 @@ fn parse_entry_point_option(
     let text = value
         .into_string()
         .map_err(|_| AppError::new("entry-point RVA must use valid text"))?;
-    let parsed =
-        parse_u32(&text).map_err(|_| AppError::new(format!("invalid entry-point RVA: {text}")))?;
+    let parsed = parse_u32(&text)
+        .map_err(|_| AppError::new(format!("invalid entry-point RVA: {text:?}")))?;
     EntryPointRva::new(parsed)
         .map(Some)
         .ok_or_else(|| AppError::new("entry-point RVA must be greater than zero"))

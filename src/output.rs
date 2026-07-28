@@ -76,8 +76,6 @@ pub(crate) fn prepare() -> AppResult<Option<OutputPlan>> {
     } else {
         CollisionPolicy::Rename
     };
-    fs::create_dir_all(&directory)
-        .map_err(|error| AppError::new(format!("cannot create mempe: {error}")))?;
     Ok(Some(OutputPlan { directory, policy }))
 }
 
@@ -90,6 +88,8 @@ impl OutputPlan {
         if files.is_empty() {
             return Ok(Vec::new());
         }
+        fs::create_dir_all(&self.directory)
+            .map_err(|error| AppError::new(format!("cannot create mempe: {error}")))?;
         let destinations = self.destinations(&files)?;
         let mut staged = Vec::new();
         staged

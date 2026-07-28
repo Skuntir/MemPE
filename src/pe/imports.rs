@@ -286,10 +286,13 @@ fn existing_thunk_slots(memory: &[u8], descriptors: &[u8], width: usize) -> BTre
             else {
                 break;
             };
-            match read_pointer(memory, slot as usize, width) {
-                None | Some(0) => break,
-                Some(_) => slots.insert(slot),
+            let Some(thunk) = read_pointer(memory, slot as usize, width) else {
+                break;
             };
+            if thunk == 0 {
+                break;
+            }
+            slots.insert(slot);
         }
     }
     slots

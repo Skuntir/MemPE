@@ -139,6 +139,9 @@ pub(super) fn read_pointer(bytes: &[u8], offset: usize, kind: PeKind) -> AppResu
 }
 
 pub(super) fn read_ascii(bytes: &[u8], rva: Rva, limit: usize) -> Option<&str> {
+    if rva.get() == 0 {
+        return None;
+    }
     let tail = bytes.get(rva.as_usize()..)?;
     let length = tail.iter().take(limit).position(|byte| *byte == 0)?;
     if length == 0 {

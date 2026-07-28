@@ -21,6 +21,10 @@ pub(crate) struct ArtifactInfo {
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) imports_rebuilt: usize,
     pub(crate) ambiguous_imports: usize,
+    pub(crate) renamed_sections: usize,
+    pub(crate) tls_callbacks: usize,
+    pub(crate) entry_point: u32,
+    pub(crate) entry_section: Option<String>,
     pub(crate) hidden: bool,
     pub(crate) is_main: bool,
 }
@@ -42,6 +46,8 @@ pub(crate) struct DumpSummary {
     pub(crate) imports_rebuilt: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) invalid_unwind_entries: usize,
+    pub(crate) renamed_sections: usize,
+    pub(crate) tls_callbacks: usize,
 }
 
 pub(crate) struct BuildReport {
@@ -102,6 +108,7 @@ impl DumpOutcome {
             || self.summary.disk_header_repairs > 0
             || self.summary.ambiguous_imports > 0
             || self.summary.invalid_unwind_entries > 0
+            || self.summary.renamed_sections > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
             || self.executable_non_image_allocations > self.hidden_non_image_images
@@ -137,6 +144,8 @@ impl DumpSummary {
         self.invalid_unwind_entries = self
             .invalid_unwind_entries
             .saturating_add(info.invalid_unwind_entries);
+        self.renamed_sections = self.renamed_sections.saturating_add(info.renamed_sections);
+        self.tls_callbacks = self.tls_callbacks.saturating_add(info.tls_callbacks);
     }
 }
 
@@ -257,6 +266,10 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         invalid_unwind_entries: rebuilt.invalid_unwind_entries,
         imports_rebuilt: rebuilt.imports_rebuilt,
         ambiguous_imports: rebuilt.ambiguous_imports,
+        renamed_sections: rebuilt.renamed_sections,
+        tls_callbacks: rebuilt.tls_callbacks,
+        entry_point: rebuilt.entry_point,
+        entry_section: rebuilt.entry_section.clone(),
         hidden: image.hidden,
         is_main: image.is_main,
     }
@@ -388,6 +401,10 @@ mod tests {
                 invalid_unwind_entries: 0,
                 imports_rebuilt: imports,
                 ambiguous_imports: 0,
+                renamed_sections: 1,
+                tls_callbacks: 2,
+                entry_point: 0x1000,
+                entry_section: None,
                 hidden,
                 is_main,
             },

@@ -1,10 +1,10 @@
 use pelite::PeFile;
 
 use crate::pe::exports::ExportIndex;
-use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u16, write_u32, write_u64};
 use crate::pe::imports::{ImportPlan, build_plan};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
-use crate::pe::{EntryPointRva, PeKind, PeModel, RegionEvidence, Rva, SectionModel};
+use crate::pe::{EntryPointRva, PeImage, PeKind, PeModel, RegionEvidence, Rva, SectionModel};
 use crate::{AppError, AppResult};
 
 const DOS_LFANEW_OFFSET: usize = 0x3c;
@@ -18,6 +18,11 @@ const IAT_DIRECTORY: usize = 12;
 const MAX_DISK_HEADERS: usize = 1024 * 1024;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
+const TLS_DIRECTORY: usize = 9;
+const MAX_TLS_CALLBACKS: usize = 1_024;
+const SECTION_NAME_SIZE: usize = 8;
+const PRINTABLE_FIRST: u8 = 0x20;
+const PRINTABLE_LAST: u8 = 0x7e;
 const MEMPE_IMPORT_CHARACTERISTICS: u32 = 0xC000_0040;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -38,6 +43,10 @@ pub(crate) struct RebuiltImage {
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) imports_rebuilt: usize,
     pub(crate) ambiguous_imports: usize,
+    pub(crate) renamed_sections: usize,
+    pub(crate) tls_callbacks: usize,
+    pub(crate) entry_point: u32,
+    pub(crate) entry_section: Option<String>,
 }
 
 struct SectionLayout<'a> {
@@ -45,6 +54,13 @@ struct SectionLayout<'a> {
     source_length: usize,
     raw_offset: usize,
     raw_size: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImportSection {
+    Written,
+    NothingToWrite,
+    HeadersAreFull,
 }
 
 pub(crate) fn rebuild(
@@ -131,7 +147,18 @@ pub(crate) fn rebuild(
             .map_err(|_| AppError::new("directory count does not fit a PE field"))?,
     )?;
 
-    for layout in &layouts {
+    let mut renamed_sections = 0usize;
+    for (index, layout) in layouts.iter().enumerate() {
+        if let Some(name) = readable_section_name(layout.model.name(), index.saturating_add(1)) {
+            let slot = output
+                .get_mut(
+                    layout.model.header_offset
+                        ..layout.model.header_offset.saturating_add(SECTION_NAME_SIZE),
+                )
+                .ok_or_else(|| AppError::new("section name lies outside the rebuilt PE"))?;
+            slot.copy_from_slice(&name);
+            renamed_sections = renamed_sections.saturating_add(1);
+        }
         write_u32(
             &mut output,
             layout.model.header_offset.saturating_add(16),
@@ -165,14 +192,19 @@ pub(crate) fn rebuild(
     let invalid_unwind_entries =
         repair_exception_directory(&mut output, model, &layouts, header_size)?;
     let import_plan = build_plan(&image, observed_base, exports);
-    if !import_plan.groups.is_empty() {
-        append_import_section(&mut output, model, &import_plan)?;
-    } else if import_plan.existing.is_empty() {
+    let import_section = if import_plan.groups.is_empty() {
+        ImportSection::NothingToWrite
+    } else {
+        append_import_section(&mut output, model, &import_plan)?
+    };
+    let written = import_section == ImportSection::Written;
+    if !written && import_plan.existing.is_empty() {
         cleared_directories = clear_directory(&mut output, model, IMPORT_DIRECTORY)?
             .saturating_add(cleared_directories);
     }
     apply_entry_point(&mut output, model, entry_point)?;
     write_derived_header_fields(&mut output, model)?;
+    let final_entry_point = read_u32(&output, model.entry_point_offset)?;
     PeFile::from_bytes(&output).map_err(|error| {
         AppError::new(format!("rebuilt PE failed independent reparse: {error}"))
     })?;
@@ -181,16 +213,17 @@ pub(crate) fn rebuild(
         bytes: output,
         kind: model.kind,
         is_dll: model.is_dll,
-        section_count: model
-            .sections
-            .len()
-            .saturating_add(usize::from(!import_plan.groups.is_empty())),
+        section_count: model.sections.len().saturating_add(usize::from(written)),
         salvaged_headers: model.salvaged,
         disk_headers_used,
         cleared_directories,
         invalid_unwind_entries,
-        imports_rebuilt: import_plan.recovered,
+        imports_rebuilt: if written { import_plan.recovered } else { 0 },
         ambiguous_imports: import_plan.ambiguous,
+        renamed_sections,
+        tls_callbacks: count_tls_callbacks(&image, observed_base),
+        entry_point: final_entry_point,
+        entry_section: entry_section_name(&layouts, final_entry_point),
     })
 }
 
@@ -697,11 +730,9 @@ fn append_import_section(
     output: &mut Vec<u8>,
     model: &PeModel,
     plan: &ImportPlan,
-) -> AppResult<()> {
+) -> AppResult<ImportSection> {
     if IMPORT_DIRECTORY >= model.directory_count {
-        return Err(AppError::new(
-            "PE optional header has no import-directory slot",
-        ));
+        return Ok(ImportSection::HeadersAreFull);
     }
     let section_header = model
         .sections
@@ -713,9 +744,7 @@ fn append_import_section(
     let header_limit = usize::try_from(read_u32(output, model.size_of_headers_offset)?)
         .map_err(|_| AppError::new("PE header size does not fit memory"))?;
     if section_header.saturating_add(SECTION_HEADER_SIZE) > header_limit {
-        return Err(AppError::new(
-            "PE headers have no room for the recovered import section",
-        ));
+        return Ok(ImportSection::HeadersAreFull);
     }
     let virtual_address = align_up_u64(
         u64::from(read_u32(output, model.size_of_image_offset)?),
@@ -793,7 +822,7 @@ fn append_import_section(
         descriptor_size,
     )?;
     clear_directory(output, model, IAT_DIRECTORY)?;
-    Ok(())
+    Ok(ImportSection::Written)
 }
 
 fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> AppResult<Vec<u8>> {
@@ -865,6 +894,77 @@ fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> Ap
         )?;
     }
     Ok(payload)
+}
+
+fn readable_section_name(name: &[u8; 8], position: usize) -> Option<[u8; 8]> {
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    let label = name.get(..end)?;
+    if !label.is_empty()
+        && label
+            .iter()
+            .all(|byte| (PRINTABLE_FIRST..=PRINTABLE_LAST).contains(byte))
+    {
+        return None;
+    }
+    let text = format!(".sec{position:02}");
+    let bytes = text.as_bytes();
+    let mut replacement = [0u8; SECTION_NAME_SIZE];
+    replacement.get_mut(..bytes.len())?.copy_from_slice(bytes);
+    Some(replacement)
+}
+
+fn count_tls_callbacks(image: &PeImage<'_>, observed_base: usize) -> usize {
+    let Ok(Some(directory)) = image.directory(TLS_DIRECTORY) else {
+        return 0;
+    };
+    let model = image.model();
+    let memory = image.bytes();
+    let width: usize = if model.kind() == PeKind::Pe32 { 4 } else { 8 };
+    let Some(table_offset) = width
+        .checked_mul(3)
+        .and_then(|offset| directory.rva().as_usize().checked_add(offset))
+    else {
+        return 0;
+    };
+    let Ok(table) = read_pointer(memory, table_offset, model.kind()) else {
+        return 0;
+    };
+    let Some(table_rva) = table.checked_sub(observed_base) else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for index in 0..MAX_TLS_CALLBACKS {
+        let Some(offset) = index
+            .checked_mul(width)
+            .and_then(|offset| table_rva.checked_add(offset))
+        else {
+            break;
+        };
+        match read_pointer(memory, offset, model.kind()) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => count = count.saturating_add(1),
+        }
+    }
+    count
+}
+
+fn entry_section_name(layouts: &[SectionLayout<'_>], entry_point: u32) -> Option<String> {
+    let rva = Rva(entry_point);
+    let (index, layout) = layouts
+        .iter()
+        .enumerate()
+        .find(|(_, layout)| layout.model.contains_rva(rva))?;
+    let name = readable_section_name(layout.model.name(), index.saturating_add(1))
+        .unwrap_or(*layout.model.name());
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    let label = String::from_utf8_lossy(name.get(..end)?).into_owned();
+    (!label.is_empty()).then_some(label)
 }
 
 fn import_descriptor_bytes(plan: &ImportPlan) -> AppResult<usize> {
@@ -987,7 +1087,7 @@ mod tests {
 
     use super::{
         IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
-        rebuild, recovered_characteristics,
+        readable_section_name, rebuild, recovered_characteristics,
     };
     use crate::pe::{EntryPointRva, ExportIndex, PeKind, RegionEvidence};
 
@@ -1197,6 +1297,17 @@ mod tests {
         assert_ne!(characteristics & IMAGE_SCN_MEM_READ, 0);
         assert_eq!(characteristics & IMAGE_SCN_MEM_WRITE, 0);
         Ok(())
+    }
+
+    #[test]
+    fn replaces_only_unreadable_section_names() {
+        let printable = readable_section_name(b".text\0\0\0", 1);
+        let empty = readable_section_name(b"\0\0\0\0\0\0\0\0", 3);
+        let binary = readable_section_name(&[0xE7, 0x91, 0x2A, 0, 0, 0, 0, 0], 7);
+
+        assert_eq!(printable, None);
+        assert_eq!(empty, Some(*b".sec03\0\0"));
+        assert_eq!(binary, Some(*b".sec07\0\0"));
     }
 
     #[test]

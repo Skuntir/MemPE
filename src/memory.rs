@@ -327,14 +327,9 @@ fn capture_from_space(
 
     let mut total_size = 0usize;
     for (base, group) in groups {
-        let size = group
-            .end
-            .checked_sub(base)
-            .ok_or_else(|| AppError::new("image allocation has an invalid address range"))?;
+        let size = group.end.saturating_sub(base);
         if size == 0 || size > MAX_IMAGE_SIZE {
-            return Err(AppError::new(format!(
-                "image at 0x{base:016X} has unsupported size {size} bytes"
-            )));
+            continue;
         }
         add_image_size(&mut total_size, size)?;
         images.push(read_image(
@@ -532,9 +527,11 @@ fn find_hidden_images(
     }
 
     let mut found = Vec::new();
+    let mut captured_allocations = BTreeSet::new();
     let mut scanned_pages = 0usize;
     for region in regions {
-        if !executable_allocations.contains(&region.allocation_base)
+        if captured_allocations.contains(&region.allocation_base)
+            || !executable_allocations.contains(&region.allocation_base)
             || region.state != MEM_COMMIT.0
             || !is_readable(region.protect)
         {
@@ -570,16 +567,16 @@ fn find_hidden_images(
                 continue;
             }
             if available > MAX_IMAGE_SIZE {
-                return Err(AppError::new(format!(
-                    "hidden image allocation at 0x{base:016X} exceeds the 1 GiB image safety limit"
-                )));
+                continue;
             }
             found.push((base, available));
+            captured_allocations.insert(region.allocation_base);
             if found.len() > MAX_IMAGES {
                 return Err(AppError::new(
                     "hidden image count exceeds the 4096-image safety limit",
                 ));
             }
+            break;
         }
     }
     Ok(found)

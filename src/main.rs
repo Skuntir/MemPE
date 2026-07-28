@@ -179,6 +179,17 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
                 main.context.kind, main.context.sections, main.context.base
             ),
         );
+        console.field(
+            "Entry",
+            format_args!(
+                "0x{:08X} ({})",
+                main.context.entry_point,
+                main.context
+                    .entry_section
+                    .as_deref()
+                    .unwrap_or("outside every section")
+            ),
+        );
     }
     console.field("DLLs", format_args!("{}", outcome.summary.dlls));
     console.field(
@@ -205,6 +216,10 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
     console.field(
         "Imports",
         format_args!("{} recovered", outcome.summary.imports_rebuilt),
+    );
+    console.field(
+        "TLS",
+        format_args!("{} callbacks", outcome.summary.tls_callbacks),
     );
     console.field(
         "Non-image",
@@ -258,6 +273,12 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
         console.warning(format_args!(
             "{} images used disk headers; section data came from memory",
             summary.disk_header_repairs
+        ));
+    }
+    if summary.renamed_sections > 0 {
+        console.warning(format_args!(
+            "{} unreadable section names were replaced",
+            summary.renamed_sections
         ));
     }
 }

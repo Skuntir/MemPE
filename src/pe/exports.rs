@@ -335,6 +335,19 @@ mod tests {
     use super::{Definitions, ExportKey, parse_forward_target};
 
     #[test]
+    fn ignores_a_zero_export_name_rva() {
+        let mut image = vec![0u8; 0x200];
+        image[..4].copy_from_slice(b"MZ\0\0");
+        image[0x100..0x108].copy_from_slice(b"real.dll");
+
+        assert_eq!(super::read_ascii(&image, 0), None);
+        assert_eq!(
+            super::read_ascii(&image, 0x100).as_deref(),
+            Some("real.dll")
+        );
+    }
+
+    #[test]
     fn parses_named_and_ordinal_forwarders() {
         assert!(parse_forward_target("KERNELBASE.CreateFileW").is_some());
         assert!(parse_forward_target("NTDLL.#42").is_some());
