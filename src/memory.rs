@@ -18,6 +18,9 @@ use windows::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY, VirtualQueryEx,
 };
+use windows::Win32::System::ProcessStatus::{
+    K32GetMappedFileNameW, K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_CREATE_PROCESS, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -39,6 +42,10 @@ const STABLE_POLL_COUNT: usize = 30;
 const STABLE_MATCH_COUNT: usize = 3;
 const STABLE_POLL_DELAY: Duration = Duration::from_millis(100);
 const MAX_STABILITY_READS: usize = 256;
+const MAX_MAPPED_PATH_CHARS: usize = 1_024;
+const WORKING_SET_CHUNK: usize = 512;
+const WORKING_SET_VALID: usize = 1;
+const WORKING_SET_SHARED: usize = 1 << 15;
 
 pub(crate) enum AcquisitionMode {
     PssClone,
@@ -63,6 +70,15 @@ pub(crate) struct CapturedImage {
     pub(crate) path: Option<PathBuf>,
     pub(crate) is_main: bool,
     pub(crate) hidden: bool,
+    pub(crate) linked: bool,
+    pub(crate) resident_pages: usize,
+    pub(crate) private_pages: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PageCoverage {
+    resident: usize,
+    private: usize,
 }
 
 pub(crate) struct Capture {
@@ -177,10 +193,9 @@ impl AddressSpace {
             }),
             Err(snapshot_error) => {
                 let started = Instant::now();
-                let process =
-                    OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+                let space = Self::open_live(target)?;
                 Ok(AcquiredAddressSpace {
-                    space: Self::Live(process),
+                    space,
                     mode: AcquisitionMode::LiveRead,
                     setup_elapsed: started.elapsed(),
                     fallback_reason: Some(snapshot_error.to_string()),
@@ -210,12 +225,23 @@ impl AddressSpace {
 }
 
 pub(crate) fn capture(target: &TargetProcess) -> AppResult<Capture> {
-    let acquired = AddressSpace::acquire(target)?;
-    let (images, non_image_count) = capture_from_space(&acquired.space, target)?;
+    let coverage = measure_image_pages(target);
+    let AcquiredAddressSpace {
+        space,
+        mode,
+        setup_elapsed,
+        fallback_reason,
+    } = AddressSpace::acquire(target)?;
+    let (mut images, non_image_count) = capture_from_space(&space, target)?;
+    drop(space);
+    if let Ok(process) = OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+    {
+        annotate_images(process.raw(), &mut images, &coverage);
+    }
     Ok(Capture {
-        mode: acquired.mode,
-        setup_elapsed: acquired.setup_elapsed,
-        fallback_reason: acquired.fallback_reason,
+        mode,
+        setup_elapsed,
+        fallback_reason,
         images,
         executable_non_image_allocations: non_image_count,
     })
@@ -503,7 +529,100 @@ fn read_image(
         path: module.map(|value| value.path.clone()),
         is_main: base == target.main_module.base,
         hidden,
+        linked: module.is_some(),
+        resident_pages: 0,
+        private_pages: 0,
     })
+}
+
+fn measure_image_pages(target: &TargetProcess) -> BTreeMap<usize, PageCoverage> {
+    let Ok(process) = OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+    else {
+        return BTreeMap::new();
+    };
+    let Ok(regions) = list_regions(process.raw()) else {
+        return BTreeMap::new();
+    };
+    let mut extents = BTreeMap::<usize, usize>::new();
+    for region in regions.iter().filter(|region| {
+        region.kind == MEM_IMAGE.0 && region.state == MEM_COMMIT.0 && region.allocation_base != 0
+    }) {
+        let end = region.base.saturating_add(region.size);
+        extents
+            .entry(region.allocation_base)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
+    }
+    extents
+        .into_iter()
+        .take(MAX_IMAGES)
+        .map(|(base, end)| {
+            (
+                base,
+                measure_pages(process.raw(), base, end.saturating_sub(base)),
+            )
+        })
+        .collect()
+}
+
+fn annotate_images(
+    process: HANDLE,
+    images: &mut [CapturedImage],
+    coverage: &BTreeMap<usize, PageCoverage>,
+) {
+    for image in images {
+        if image.name.is_none() {
+            image.name = mapped_file_name(process, image.base);
+        }
+        if let Some(pages) = coverage.get(&image.base) {
+            image.resident_pages = pages.resident;
+            image.private_pages = pages.private;
+        }
+    }
+}
+
+fn mapped_file_name(process: HANDLE, base: usize) -> Option<String> {
+    let mut buffer = [0u16; MAX_MAPPED_PATH_CHARS];
+    let length = unsafe { K32GetMappedFileNameW(process, base as *const c_void, &mut buffer) };
+    let used = usize::try_from(length).ok()?;
+    let path = String::from_utf16_lossy(buffer.get(..used)?);
+    let name = path.rsplit(['\\', '/']).next()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
+    let mut coverage = PageCoverage::default();
+    let pages = size.div_ceil(PAGE_SIZE);
+    let mut first = 0usize;
+    while first < pages {
+        let count = pages.saturating_sub(first).min(WORKING_SET_CHUNK);
+        let mut entries = [PSAPI_WORKING_SET_EX_INFORMATION::default(); WORKING_SET_CHUNK];
+        for (slot, entry) in entries.iter_mut().take(count).enumerate() {
+            let offset = first.saturating_add(slot).saturating_mul(PAGE_SIZE);
+            entry.VirtualAddress = base.saturating_add(offset) as *mut c_void;
+        }
+        let Ok(bytes) =
+            u32::try_from(count.saturating_mul(size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()))
+        else {
+            break;
+        };
+        if !unsafe { K32QueryWorkingSetEx(process, entries.as_mut_ptr().cast(), bytes) }.as_bool() {
+            break;
+        }
+        for entry in entries.iter().take(count) {
+            // SAFETY: Flags is the integer view of the union and every bit pattern is valid.
+            let flags = unsafe { entry.VirtualAttributes.Flags };
+            if flags & WORKING_SET_VALID == 0 {
+                continue;
+            }
+            coverage.resident = coverage.resident.saturating_add(1);
+            if flags & WORKING_SET_SHARED == 0 {
+                coverage.private = coverage.private.saturating_add(1);
+            }
+        }
+        first = first.saturating_add(count);
+    }
+    coverage
 }
 
 fn find_hidden_images(

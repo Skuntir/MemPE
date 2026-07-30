@@ -1,3 +1,4 @@
+mod carve;
 mod exports;
 mod image;
 mod imports;
@@ -6,6 +7,7 @@ mod rebuild;
 
 use std::fmt::{Display, Formatter};
 
+pub(crate) use carve::carve_embedded;
 pub(crate) use exports::{ExportIndex, ExportStats, embedded_module_name};
 pub(crate) use parse::memory_image_size;
 pub(crate) use rebuild::{RebuiltImage, rebuild};
@@ -79,6 +81,7 @@ struct SectionModel {
 struct PeModel {
     kind: PeKind,
     is_dll: bool,
+    subsystem: u16,
     nt_offset: usize,
     size_of_code_offset: usize,
     size_of_initialized_data_offset: usize,
@@ -88,6 +91,7 @@ struct PeModel {
     image_base_offset: usize,
     size_of_image_offset: usize,
     size_of_headers_offset: usize,
+    dll_characteristics_offset: usize,
     number_of_directories_offset: usize,
     data_directory_offset: usize,
     directory_count: usize,

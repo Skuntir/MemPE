@@ -18,7 +18,18 @@ const IAT_DIRECTORY: usize = 12;
 const MAX_DISK_HEADERS: usize = 1024 * 1024;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
+const BASERELOC_DIRECTORY: usize = 5;
+const RELOCATION_BLOCK_HEADER: usize = 8;
+const RELOCATION_ABSOLUTE: u16 = 0;
+const RELOCATION_HIGHLOW: u16 = 3;
+const RELOCATION_DIR64: u16 = 10;
+const MAX_RELOCATION_BLOCKS: usize = 65_536;
 const TLS_DIRECTORY: usize = 9;
+const DEBUG_ENTRY_SIZE: usize = 28;
+const DEBUG_ENTRY_RAW_RVA: usize = 20;
+const DEBUG_ENTRY_RAW_POINTER: usize = 24;
+const MAX_DEBUG_ENTRIES: usize = 256;
+const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 const MAX_TLS_CALLBACKS: usize = 1_024;
 const SECTION_NAME_SIZE: usize = 8;
 const PRINTABLE_FIRST: u8 = 0x20;
@@ -47,6 +58,8 @@ pub(crate) struct RebuiltImage {
     pub(crate) tls_callbacks: usize,
     pub(crate) entry_point: u32,
     pub(crate) entry_section: Option<String>,
+    pub(crate) repaired_debug_entries: usize,
+    pub(crate) fixed_image_base: bool,
 }
 
 struct SectionLayout<'a> {
@@ -54,13 +67,6 @@ struct SectionLayout<'a> {
     source_length: usize,
     raw_offset: usize,
     raw_size: usize,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ImportSection {
-    Written,
-    NothingToWrite,
-    HeadersAreFull,
 }
 
 pub(crate) fn rebuild(
@@ -124,80 +130,20 @@ pub(crate) fn rebuild(
     let copied_headers = header_size.min(memory.len());
     output[..copied_headers].copy_from_slice(&memory[..copied_headers]);
 
-    write_u16(&mut output, 0, 0x5A4D)?;
-    write_u32(
-        &mut output,
-        DOS_LFANEW_OFFSET,
-        u32::try_from(model.nt_offset)
-            .map_err(|_| AppError::new("NT header offset does not fit a PE field"))?,
-    )?;
-    write_image_base(&mut output, model, observed_base)?;
-    let image_size = rebuilt_image_size(model)?;
-    write_u32(&mut output, model.size_of_image_offset, image_size)?;
-    write_u32(
-        &mut output,
-        model.size_of_headers_offset,
-        u32::try_from(header_size)
-            .map_err(|_| AppError::new("rebuilt header size does not fit a PE field"))?,
-    )?;
-    write_u32(
-        &mut output,
-        model.number_of_directories_offset,
-        u32::try_from(model.directory_count)
-            .map_err(|_| AppError::new("directory count does not fit a PE field"))?,
-    )?;
-
-    let mut renamed_sections = 0usize;
-    for (index, layout) in layouts.iter().enumerate() {
-        if let Some(name) = readable_section_name(layout.model.name(), index.saturating_add(1)) {
-            let slot = output
-                .get_mut(
-                    layout.model.header_offset
-                        ..layout.model.header_offset.saturating_add(SECTION_NAME_SIZE),
-                )
-                .ok_or_else(|| AppError::new("section name lies outside the rebuilt PE"))?;
-            slot.copy_from_slice(&name);
-            renamed_sections = renamed_sections.saturating_add(1);
-        }
-        write_u32(
-            &mut output,
-            layout.model.header_offset.saturating_add(16),
-            u32::try_from(layout.raw_size)
-                .map_err(|_| AppError::new("section raw size does not fit a PE field"))?,
-        )?;
-        write_u32(
-            &mut output,
-            layout.model.header_offset.saturating_add(20),
-            u32::try_from(layout.raw_offset)
-                .map_err(|_| AppError::new("section file offset does not fit a PE field"))?,
-        )?;
-        let source_offset = layout.model.virtual_address.get() as usize;
-        let source_end = source_offset
-            .checked_add(layout.source_length)
-            .ok_or_else(|| AppError::new("section source range overflowed"))?;
-        let destination_end = layout
-            .raw_offset
-            .checked_add(layout.source_length)
-            .ok_or_else(|| AppError::new("section output range overflowed"))?;
-        let source = memory
-            .get(source_offset..source_end)
-            .ok_or_else(|| AppError::new("section source range is outside captured memory"))?;
-        let destination = output
-            .get_mut(layout.raw_offset..destination_end)
-            .ok_or_else(|| AppError::new("section output range is outside rebuilt PE"))?;
-        destination.copy_from_slice(source);
-    }
+    write_core_header_fields(&mut output, model, observed_base, header_size)?;
+    let renamed_sections = write_sections(&mut output, memory, &layouts)?;
 
     let mut cleared_directories = clear_bad_directories(&mut output, model, &layouts, header_size)?;
     let invalid_unwind_entries =
         repair_exception_directory(&mut output, model, &layouts, header_size)?;
+    let repaired_debug_entries = repair_debug_directory(&mut output, model, &layouts, header_size)?;
+    let fixed_image_base = clear_dynamic_base(&mut output, model)?;
     let import_plan = build_plan(&image, observed_base, exports);
-    let import_section = if import_plan.groups.is_empty() {
-        ImportSection::NothingToWrite
+    let written = if import_plan.groups.is_empty() {
+        false
     } else {
         append_import_section(&mut output, model, &import_plan)?
     };
-    let written = import_section == ImportSection::Written;
     if !written && import_plan.existing.is_empty() {
         cleared_directories = clear_directory(&mut output, model, IMPORT_DIRECTORY)?
             .saturating_add(cleared_directories);
@@ -224,7 +170,88 @@ pub(crate) fn rebuild(
         tls_callbacks: count_tls_callbacks(&image, observed_base),
         entry_point: final_entry_point,
         entry_section: entry_section_name(&layouts, final_entry_point),
+        repaired_debug_entries,
+        fixed_image_base,
     })
+}
+
+fn write_core_header_fields(
+    output: &mut [u8],
+    model: &PeModel,
+    observed_base: usize,
+    header_size: usize,
+) -> AppResult<()> {
+    write_u16(output, 0, 0x5A4D)?;
+    write_u32(
+        output,
+        DOS_LFANEW_OFFSET,
+        u32::try_from(model.nt_offset)
+            .map_err(|_| AppError::new("NT header offset does not fit a PE field"))?,
+    )?;
+    write_image_base(output, model, observed_base)?;
+    write_u32(
+        output,
+        model.size_of_image_offset,
+        rebuilt_image_size(model)?,
+    )?;
+    write_u32(
+        output,
+        model.size_of_headers_offset,
+        u32::try_from(header_size)
+            .map_err(|_| AppError::new("rebuilt header size does not fit a PE field"))?,
+    )?;
+    write_u32(
+        output,
+        model.number_of_directories_offset,
+        u32::try_from(model.directory_count)
+            .map_err(|_| AppError::new("directory count does not fit a PE field"))?,
+    )
+}
+
+fn write_sections(
+    output: &mut [u8],
+    memory: &[u8],
+    layouts: &[SectionLayout<'_>],
+) -> AppResult<usize> {
+    let mut renamed = 0usize;
+    for (index, layout) in layouts.iter().enumerate() {
+        let header = layout.model.header_offset;
+        if let Some(name) = readable_section_name(layout.model.name(), index.saturating_add(1)) {
+            output
+                .get_mut(header..header.saturating_add(SECTION_NAME_SIZE))
+                .ok_or_else(|| AppError::new("section name lies outside the rebuilt PE"))?
+                .copy_from_slice(&name);
+            renamed = renamed.saturating_add(1);
+        }
+        write_u32(
+            output,
+            header.saturating_add(16),
+            u32::try_from(layout.raw_size)
+                .map_err(|_| AppError::new("section raw size does not fit a PE field"))?,
+        )?;
+        write_u32(
+            output,
+            header.saturating_add(20),
+            u32::try_from(layout.raw_offset)
+                .map_err(|_| AppError::new("section file offset does not fit a PE field"))?,
+        )?;
+        let source_offset = layout.model.virtual_address.get() as usize;
+        let source_end = source_offset
+            .checked_add(layout.source_length)
+            .ok_or_else(|| AppError::new("section source range overflowed"))?;
+        let destination_end = layout
+            .raw_offset
+            .checked_add(layout.source_length)
+            .ok_or_else(|| AppError::new("section output range overflowed"))?;
+        let source = memory
+            .get(source_offset..source_end)
+            .ok_or_else(|| AppError::new("section source range is outside captured memory"))?;
+        output
+            .get_mut(layout.raw_offset..destination_end)
+            .ok_or_else(|| AppError::new("section output range is outside rebuilt PE"))?
+            .copy_from_slice(source);
+    }
+    Ok(renamed)
 }
 
 fn recover_section_headers(
@@ -319,7 +346,7 @@ fn recovered_characteristics(
     let coverage = ProtectionCoverage::measure(regions, start, end);
     let mut recovered = characteristics;
     if coverage.executable > 0 {
-        recovered |= IMAGE_SCN_MEM_EXECUTE;
+        recovered |= IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
     }
     if coverage.readable > 0 {
         recovered |= IMAGE_SCN_MEM_READ;
@@ -454,8 +481,9 @@ fn clear_bad_directories(
             continue;
         }
         let valid = index != SECURITY_DIRECTORY
-            && index != DEBUG_DIRECTORY
-            && directory_is_mapped(rva, size, layouts, header_size);
+            && directory_is_mapped(rva, size, layouts, header_size)
+            && (index != BASERELOC_DIRECTORY
+                || relocations_are_walkable(output, model, layouts, header_size, rva, size));
         if !valid {
             write_u32(output, entry_offset, 0)?;
             write_u32(output, entry_offset.saturating_add(4), 0)?;
@@ -463,6 +491,63 @@ fn clear_bad_directories(
         }
     }
     Ok(cleared)
+}
+
+fn relocations_are_walkable(
+    output: &[u8],
+    model: &PeModel,
+    layouts: &[SectionLayout<'_>],
+    header_size: usize,
+    rva: u32,
+    size: u32,
+) -> bool {
+    let Some(start) = rva_to_file(rva, layouts, header_size) else {
+        return false;
+    };
+    let end = start.saturating_add(size as usize);
+    let expected = match model.kind {
+        PeKind::Pe32 => RELOCATION_HIGHLOW,
+        PeKind::Pe32Plus => RELOCATION_DIR64,
+    };
+    let mut cursor = start;
+    let mut fixups = 0usize;
+    for _block in 0..MAX_RELOCATION_BLOCKS {
+        if cursor >= end {
+            return fixups > 0;
+        }
+        let (Ok(page), Ok(block_size)) = (
+            read_u32(output, cursor),
+            read_u32(output, cursor.saturating_add(4)),
+        ) else {
+            return false;
+        };
+        let block_size = block_size as usize;
+        if block_size < RELOCATION_BLOCK_HEADER
+            || !block_size.is_multiple_of(2)
+            || cursor.saturating_add(block_size) > end
+            || rva_to_file(page, layouts, header_size).is_none()
+        {
+            return false;
+        }
+        for index in 0..block_size.saturating_sub(RELOCATION_BLOCK_HEADER) / 2 {
+            let offset = cursor
+                .saturating_add(RELOCATION_BLOCK_HEADER)
+                .saturating_add(index.saturating_mul(2));
+            let Ok(entry) = read_u16(output, offset) else {
+                return false;
+            };
+            let kind = entry >> 12;
+            if kind == RELOCATION_ABSOLUTE {
+                continue;
+            }
+            if kind != expected {
+                return false;
+            }
+            fixups = fixups.saturating_add(1);
+        }
+        cursor = cursor.saturating_add(block_size);
+    }
+    false
 }
 
 fn merge_header_evidence(memory: &[u8], disk: &[u8]) -> AppResult<Vec<u8>> {
@@ -726,13 +811,78 @@ fn runtime_function_is_valid(
     matches!(first & 0x07, 1 | 2)
 }
 
+fn repair_debug_directory(
+    output: &mut [u8],
+    model: &PeModel,
+    layouts: &[SectionLayout<'_>],
+    header_size: usize,
+) -> AppResult<usize> {
+    if DEBUG_DIRECTORY >= model.directory_count {
+        return Ok(0);
+    }
+    let entry_offset = model
+        .directory_offset(DEBUG_DIRECTORY)?
+        .ok_or_else(|| AppError::new("debug-directory slot is missing"))?;
+    let rva = read_u32(output, entry_offset)?;
+    let size = read_u32(output, entry_offset.saturating_add(4))? as usize;
+    if rva == 0 || size < DEBUG_ENTRY_SIZE {
+        return Ok(0);
+    }
+    let Some(table_offset) = rva_to_file(rva, layouts, header_size) else {
+        return Ok(0);
+    };
+    let count = (size / DEBUG_ENTRY_SIZE).min(MAX_DEBUG_ENTRIES);
+    let mut repaired = 0usize;
+    for index in 0..count {
+        let entry = table_offset
+            .checked_add(index.saturating_mul(DEBUG_ENTRY_SIZE))
+            .ok_or_else(|| AppError::new("debug-directory entry offset overflowed"))?;
+        let pointer_offset = entry.saturating_add(DEBUG_ENTRY_RAW_POINTER);
+        let (Ok(raw_rva), Ok(stored)) = (
+            read_u32(output, entry.saturating_add(DEBUG_ENTRY_RAW_RVA)),
+            read_u32(output, pointer_offset),
+        ) else {
+            break;
+        };
+        let pointer = (raw_rva != 0)
+            .then(|| rva_to_file(raw_rva, layouts, header_size))
+            .flatten()
+            .and_then(|offset| u32::try_from(offset).ok())
+            .unwrap_or(0);
+        if stored != pointer {
+            write_u32(output, pointer_offset, pointer)?;
+            repaired = repaired.saturating_add(1);
+        }
+    }
+    Ok(repaired)
+}
+
+fn clear_dynamic_base(output: &mut [u8], model: &PeModel) -> AppResult<bool> {
+    if let Some(offset) = model.directory_offset(BASERELOC_DIRECTORY)?
+        && read_u32(output, offset)? != 0
+        && read_u32(output, offset.saturating_add(4))? != 0
+    {
+        return Ok(false);
+    }
+    let characteristics = read_u16(output, model.dll_characteristics_offset)?;
+    if characteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE == 0 {
+        return Ok(false);
+    }
+    write_u16(
+        output,
+        model.dll_characteristics_offset,
+        characteristics & !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
+    )?;
+    Ok(true)
+}
+
 fn append_import_section(
     output: &mut Vec<u8>,
     model: &PeModel,
     plan: &ImportPlan,
-) -> AppResult<ImportSection> {
+) -> AppResult<bool> {
     if IMPORT_DIRECTORY >= model.directory_count {
-        return Ok(ImportSection::HeadersAreFull);
+        return Ok(false);
     }
     let section_header = model
         .sections
@@ -744,7 +894,7 @@ fn append_import_section(
     let header_limit = usize::try_from(read_u32(output, model.size_of_headers_offset)?)
         .map_err(|_| AppError::new("PE header size does not fit memory"))?;
     if section_header.saturating_add(SECTION_HEADER_SIZE) > header_limit {
-        return Ok(ImportSection::HeadersAreFull);
+        return Ok(false);
     }
     let virtual_address = align_up_u64(
         u64::from(read_u32(output, model.size_of_image_offset)?),
@@ -821,8 +971,10 @@ fn append_import_section(
         virtual_address,
         descriptor_size,
     )?;
-    clear_directory(output, model, IAT_DIRECTORY)?;
-    Ok(ImportSection::Written)
+    if plan.existing.is_empty() {
+        clear_directory(output, model, IAT_DIRECTORY)?;
+    }
+    Ok(true)
 }
 
 fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> AppResult<Vec<u8>> {
@@ -902,11 +1054,11 @@ fn readable_section_name(name: &[u8; 8], position: usize) -> Option<[u8; 8]> {
         .position(|byte| *byte == 0)
         .unwrap_or(name.len());
     let label = name.get(..end)?;
-    if !label.is_empty()
-        && label
-            .iter()
-            .all(|byte| (PRINTABLE_FIRST..=PRINTABLE_LAST).contains(byte))
-    {
+    let readable = label
+        .iter()
+        .all(|byte| (PRINTABLE_FIRST..=PRINTABLE_LAST).contains(byte))
+        && label.iter().any(|byte| *byte != b' ');
+    if readable {
         return None;
     }
     let text = format!(".sec{position:02}");
@@ -986,8 +1138,7 @@ fn append_ascii(bytes: &mut Vec<u8>, value: &str) -> AppResult<()> {
 }
 
 fn align_vec(bytes: &mut Vec<u8>, alignment: usize) {
-    let padding = (alignment - bytes.len() % alignment) % alignment;
-    bytes.resize(bytes.len().saturating_add(padding), 0);
+    bytes.resize(bytes.len().next_multiple_of(alignment), 0);
 }
 
 fn write_thunk(bytes: &mut [u8], offset: usize, kind: PeKind, value: u64) -> AppResult<()> {
@@ -1086,8 +1237,9 @@ mod tests {
     use pelite::PeFile;
 
     use super::{
-        IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
-        readable_section_name, rebuild, recovered_characteristics,
+        IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_EXECUTE,
+        IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, readable_section_name, rebuild,
+        recovered_characteristics,
     };
     use crate::pe::{EntryPointRva, ExportIndex, PeKind, RegionEvidence};
 
@@ -1274,7 +1426,7 @@ mod tests {
     fn recovers_section_access_from_committed_memory() -> Result<(), Box<dyn std::error::Error>> {
         let mut memory = fixture_pe64();
         let section = 0x98 + 0xF0;
-        put_u32(&mut memory, section + 36, IMAGE_SCN_CNT_CODE);
+        put_u32(&mut memory, section + 36, IMAGE_SCN_CNT_INITIALIZED_DATA);
         let regions = [RegionEvidence {
             offset: 0x1000,
             size: 0x1000,
@@ -1295,7 +1447,32 @@ mod tests {
 
         assert_ne!(characteristics & IMAGE_SCN_MEM_EXECUTE, 0);
         assert_ne!(characteristics & IMAGE_SCN_MEM_READ, 0);
+        assert_ne!(characteristics & IMAGE_SCN_CNT_CODE, 0);
         assert_eq!(characteristics & IMAGE_SCN_MEM_WRITE, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn repoints_debug_entries_at_the_rebuilt_layout() -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let optional = 0x98;
+        put_u32(&mut memory, optional + 112 + 6 * 8, 0x1100);
+        put_u32(&mut memory, optional + 112 + 6 * 8 + 4, 28);
+        put_u32(&mut memory, 0x1100 + 20, 0x1200);
+        put_u32(&mut memory, 0x1100 + 24, 0xDEAD);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+        )?;
+
+        assert_eq!(rebuilt.repaired_debug_entries, 1);
+        assert_eq!(get_u32(&rebuilt.bytes, 0x300 + 24), 0x400);
+        assert_ne!(get_u32(&rebuilt.bytes, 0x98 + 112 + 6 * 8), 0);
         Ok(())
     }
 
@@ -1304,10 +1481,12 @@ mod tests {
         let printable = readable_section_name(b".text\0\0\0", 1);
         let empty = readable_section_name(b"\0\0\0\0\0\0\0\0", 3);
         let binary = readable_section_name(&[0xE7, 0x91, 0x2A, 0, 0, 0, 0, 0], 7);
+        let blank = readable_section_name(b"        ", 2);
 
         assert_eq!(printable, None);
         assert_eq!(empty, Some(*b".sec03\0\0"));
         assert_eq!(binary, Some(*b".sec07\0\0"));
+        assert_eq!(blank, Some(*b".sec02\0\0"));
     }
 
     #[test]

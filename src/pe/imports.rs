@@ -446,6 +446,7 @@ fn existing_descriptors(image: &PeImage<'_>) -> Option<Vec<u8>> {
     }
     let max_descriptors = (directory_size as usize / IMPORT_DESCRIPTOR_SIZE).min(MAX_IMPORT_GROUPS);
     let mut descriptors = Vec::new();
+    let mut budget = MAX_IMPORTS;
     for index in 0..max_descriptors {
         let offset =
             (directory_rva as usize).checked_add(index.saturating_mul(IMPORT_DESCRIPTOR_SIZE))?;
@@ -457,16 +458,28 @@ fn existing_descriptors(image: &PeImage<'_>) -> Option<Vec<u8>> {
         let name_rva = read_u32(memory, offset.saturating_add(12))?;
         let first_thunk = read_u32(memory, offset.saturating_add(16))?;
         if read_ascii(memory, name_rva as usize).is_none()
-            || !thunk_table_is_valid(memory, model.kind(), original_thunk, first_thunk)
+            || !thunk_table_is_valid(
+                memory,
+                model.kind(),
+                original_thunk,
+                first_thunk,
+                &mut budget,
+            )
         {
-            return None;
+            continue;
         }
         descriptors.extend_from_slice(descriptor);
     }
-    None
+    (!descriptors.is_empty()).then_some(descriptors)
 }
 
-fn thunk_table_is_valid(memory: &[u8], kind: PeKind, original: u32, first: u32) -> bool {
+fn thunk_table_is_valid(
+    memory: &[u8],
+    kind: PeKind,
+    original: u32,
+    first: u32,
+    budget: &mut usize,
+) -> bool {
     let table = if original != 0 { original } else { first } as usize;
     let width = if kind == PeKind::Pe32 { 4 } else { 8 };
     let ordinal_flag = if kind == PeKind::Pe32 {
@@ -474,13 +487,14 @@ fn thunk_table_is_valid(memory: &[u8], kind: PeKind, original: u32, first: u32) 
     } else {
         0x8000_0000_0000_0000usize
     };
-    for index in 0..MAX_IMPORTS {
+    for index in 0..*budget {
         let Some(offset) = table.checked_add(index.saturating_mul(width)) else {
             return false;
         };
         let Some(value) = read_pointer(memory, offset, width) else {
             return false;
         };
+        *budget = budget.saturating_sub(1);
         if value == 0 {
             return index > 0;
         }

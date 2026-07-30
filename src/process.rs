@@ -19,7 +19,8 @@ use windows::Win32::System::SystemInformation::{
 };
 use windows::Win32::System::Threading::{
     GetProcessTimes, IsWow64Process2, OpenProcess, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -115,7 +116,7 @@ pub(crate) fn query(pid: ProcessId) -> AppResult<TargetProcess> {
         .to_owned();
     let architecture = get_architecture(&handle)?;
     let created = get_creation_time(&handle)?;
-    let modules = get_modules(pid)?;
+    let modules = get_modules(pid).map_err(|error| explain_denied_access(pid, error))?;
     let main_module = find_main_module(&path, &modules)?;
 
     Ok(TargetProcess {
@@ -305,6 +306,16 @@ fn get_modules(pid: ProcessId) -> AppResult<Vec<ModuleInfo>> {
         }
     }
     Err(AppError::new("too many modules were returned"))
+}
+
+fn explain_denied_access(pid: ProcessId, error: AppError) -> AppError {
+    if OwnedHandle::open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ).is_ok() {
+        return error;
+    }
+    AppError::new(
+        "the target refuses memory access; run mempe from an elevated terminal, and note that a \
+         protected process can deny access even to an administrator",
+    )
 }
 
 fn module_snapshot(pid: ProcessId) -> AppResult<OwnedHandle> {

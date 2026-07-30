@@ -25,8 +25,43 @@ pub(crate) struct ArtifactInfo {
     pub(crate) tls_callbacks: usize,
     pub(crate) entry_point: u32,
     pub(crate) entry_section: Option<String>,
+    pub(crate) repaired_debug_entries: usize,
+    pub(crate) fixed_image_base: bool,
+    pub(crate) resident_pages: usize,
+    pub(crate) private_pages: usize,
+    pub(crate) unlinked: bool,
+    pub(crate) embedded: bool,
     pub(crate) hidden: bool,
     pub(crate) is_main: bool,
+}
+
+impl ArtifactInfo {
+    fn embedded(base: usize, kind: PeKind) -> Self {
+        Self {
+            base,
+            kind,
+            sections: 0,
+            unreadable_pages: 0,
+            salvaged_headers: false,
+            disk_headers_used: false,
+            cleared_directories: 0,
+            invalid_unwind_entries: 0,
+            imports_rebuilt: 0,
+            ambiguous_imports: 0,
+            renamed_sections: 0,
+            tls_callbacks: 0,
+            entry_point: 0,
+            entry_section: None,
+            repaired_debug_entries: 0,
+            fixed_image_base: false,
+            resident_pages: 0,
+            private_pages: 0,
+            unlinked: false,
+            embedded: true,
+            hidden: false,
+            is_main: false,
+        }
+    }
 }
 
 pub(crate) struct BuildFailure {
@@ -48,6 +83,12 @@ pub(crate) struct DumpSummary {
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
+    pub(crate) repaired_debug_entries: usize,
+    pub(crate) fixed_image_bases: usize,
+    pub(crate) resident_pages: usize,
+    pub(crate) private_pages: usize,
+    pub(crate) unlinked_images: usize,
+    pub(crate) embedded_pes: usize,
 }
 
 pub(crate) struct BuildReport {
@@ -67,8 +108,8 @@ pub(crate) struct DumpOutcome {
     pub(crate) export_stats: ExportStats,
     pub(crate) executable_non_image_allocations: usize,
     pub(crate) hidden_non_image_images: usize,
-    main_rebuilt: bool,
-    dll_failures: usize,
+    pub(crate) main_rebuilt: bool,
+    pub(crate) dll_failures: usize,
 }
 
 impl BuildReport {
@@ -93,14 +134,6 @@ impl DumpOutcome {
         self.main_rebuilt && self.dll_failures == 0
     }
 
-    pub(crate) fn main_rebuilt(&self) -> bool {
-        self.main_rebuilt
-    }
-
-    pub(crate) fn dll_failures(&self) -> usize {
-        self.dll_failures
-    }
-
     pub(crate) fn has_warnings(&self) -> bool {
         self.summary.unreadable_pages > 0
             || self.summary.cleared_directories > 0
@@ -109,6 +142,9 @@ impl DumpOutcome {
             || self.summary.ambiguous_imports > 0
             || self.summary.invalid_unwind_entries > 0
             || self.summary.renamed_sections > 0
+            || self.summary.repaired_debug_entries > 0
+            || self.summary.fixed_image_bases > 0
+            || self.summary.unlinked_images > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
             || self.executable_non_image_allocations > self.hidden_non_image_images
@@ -125,6 +161,10 @@ impl DumpSummary {
     }
 
     fn add(&mut self, info: &ArtifactInfo) {
+        if info.embedded {
+            self.embedded_pes = self.embedded_pes.saturating_add(1);
+            return;
+        }
         self.dlls = self.dlls.saturating_add(usize::from(!info.is_main));
         self.hidden_images = self.hidden_images.saturating_add(usize::from(info.hidden));
         self.unreadable_pages = self.unreadable_pages.saturating_add(info.unreadable_pages);
@@ -146,6 +186,17 @@ impl DumpSummary {
             .saturating_add(info.invalid_unwind_entries);
         self.renamed_sections = self.renamed_sections.saturating_add(info.renamed_sections);
         self.tls_callbacks = self.tls_callbacks.saturating_add(info.tls_callbacks);
+        self.repaired_debug_entries = self
+            .repaired_debug_entries
+            .saturating_add(info.repaired_debug_entries);
+        self.fixed_image_bases = self
+            .fixed_image_bases
+            .saturating_add(usize::from(info.fixed_image_base));
+        self.resident_pages = self.resident_pages.saturating_add(info.resident_pages);
+        self.private_pages = self.private_pages.saturating_add(info.private_pages);
+        self.unlinked_images = self
+            .unlinked_images
+            .saturating_add(usize::from(info.unlinked));
     }
 }
 
@@ -181,6 +232,7 @@ pub(crate) fn build(
         return report;
     }
     for image in images {
+        push_embedded(target, &image, &mut report);
         let validates_manual_entry_point = image.is_main && entry_point.is_some();
         build_image(target, image, &exports, entry_point, &mut report);
         if validates_manual_entry_point && !report.main_rebuilt {
@@ -188,6 +240,50 @@ pub(crate) fn build(
         }
     }
     report
+}
+
+fn push_embedded(target: &TargetProcess, image: &CapturedImage, report: &mut BuildReport) {
+    let label = embedded_label(target, image);
+    for (index, embedded) in pe::carve_embedded(&image.bytes).into_iter().enumerate() {
+        let Some(bytes) = copy_range(&image.bytes, embedded.offset, embedded.length) else {
+            continue;
+        };
+        report.files.push(OutputFile {
+            preferred_name: format!(
+                "{label}.embed{}.{}",
+                index.saturating_add(1),
+                embedded.extension
+            ),
+            bytes,
+            context: ArtifactInfo::embedded(
+                image.base.saturating_add(embedded.offset),
+                embedded.kind,
+            ),
+        });
+    }
+}
+
+fn embedded_label(target: &TargetProcess, image: &CapturedImage) -> String {
+    let name = if image.is_main {
+        target.name.as_str()
+    } else if let Some(name) = &image.name {
+        name.as_str()
+    } else {
+        return format!("module-{:016X}", image.base);
+    };
+    Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn copy_range(bytes: &[u8], offset: usize, length: usize) -> Option<Vec<u8>> {
+    let slice = bytes.get(offset..offset.checked_add(length)?)?;
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(slice.len()).ok()?;
+    copy.extend_from_slice(slice);
+    Some(copy)
 }
 
 fn prepare_images(images: &mut [CapturedImage]) {
@@ -270,6 +366,12 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         tls_callbacks: rebuilt.tls_callbacks,
         entry_point: rebuilt.entry_point,
         entry_section: rebuilt.entry_section.clone(),
+        repaired_debug_entries: rebuilt.repaired_debug_entries,
+        fixed_image_base: rebuilt.fixed_image_base,
+        resident_pages: image.resident_pages,
+        private_pages: image.private_pages,
+        unlinked: !image.linked && !image.hidden,
+        embedded: false,
         hidden: image.hidden,
         is_main: image.is_main,
     }
@@ -405,6 +507,12 @@ mod tests {
                 tls_callbacks: 2,
                 entry_point: 0x1000,
                 entry_section: None,
+                repaired_debug_entries: 1,
+                fixed_image_base: true,
+                resident_pages: 8,
+                private_pages: 3,
+                unlinked: false,
+                embedded: false,
                 hidden,
                 is_main,
             },

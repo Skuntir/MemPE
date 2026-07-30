@@ -192,6 +192,7 @@ fn parse_candidate(
     Ok(PeModel {
         kind,
         is_dll: characteristics & IMAGE_FILE_DLL != 0,
+        subsystem: read_u16(bytes, checked_add(optional_offset, 68, "subsystem")?)?,
         nt_offset,
         size_of_code_offset: checked_add(optional_offset, 4, "code size")?,
         size_of_initialized_data_offset: checked_add(optional_offset, 8, "initialized-data size")?,
@@ -205,6 +206,7 @@ fn parse_candidate(
         image_base_offset: checked_add(optional_offset, image_base_relative, "image base")?,
         size_of_image_offset,
         size_of_headers_offset,
+        dll_characteristics_offset: checked_add(optional_offset, 70, "DLL characteristics")?,
         number_of_directories_offset,
         data_directory_offset,
         directory_count,

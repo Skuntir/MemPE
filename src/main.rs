@@ -157,8 +157,7 @@ fn finish_dump(
     } else {
         console.partial(format_args!(
             "Main rebuilt: {}; DLL failures: {}",
-            outcome.main_rebuilt(),
-            outcome.dll_failures()
+            outcome.main_rebuilt, outcome.dll_failures
         ));
         ExitCode::from(3)
     }
@@ -190,11 +189,29 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
                     .unwrap_or("outside every section")
             ),
         );
+        if main.context.private_pages > 0 {
+            console.field(
+                "Runtime",
+                format_args!(
+                    "{} of {} resident pages were written after load",
+                    main.context.private_pages, main.context.resident_pages
+                ),
+            );
+        } else {
+            console.field(
+                "Runtime",
+                format_args!("not measurable; re-run against a freshly started process"),
+            );
+        }
     }
     console.field("DLLs", format_args!("{}", outcome.summary.dlls));
     console.field(
         "Hidden PEs",
         format_args!("{}", outcome.summary.hidden_images),
+    );
+    console.field(
+        "Embedded",
+        format_args!("{} carved PEs", outcome.summary.embedded_pes),
     );
     console.field("Folder", format_args!("{}", output.directory().display()));
     console.blank();
@@ -279,6 +296,24 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
         console.warning(format_args!(
             "{} unreadable section names were replaced",
             summary.renamed_sections
+        ));
+    }
+    if summary.repaired_debug_entries > 0 {
+        console.warning(format_args!(
+            "{} debug entries were repointed at the rebuilt layout",
+            summary.repaired_debug_entries
+        ));
+    }
+    if summary.fixed_image_bases > 0 {
+        console.warning(format_args!(
+            "{} images lost ASLR because they have no relocations",
+            summary.fixed_image_bases
+        ));
+    }
+    if summary.unlinked_images > 0 {
+        console.warning(format_args!(
+            "{} mapped images are missing from the loader module list",
+            summary.unlinked_images
         ));
     }
 }
