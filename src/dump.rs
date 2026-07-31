@@ -21,6 +21,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) cleared_directories: usize,
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) imports_rebuilt: usize,
+    pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
@@ -33,6 +34,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) entry_unwind_covered: Option<bool>,
     pub(crate) write_execute_sections: usize,
     pub(crate) never_decrypted_sections: usize,
+    pub(crate) absent_sections: usize,
     pub(crate) resident_pages: usize,
     pub(crate) private_pages: usize,
     pub(crate) unlinked: bool,
@@ -44,10 +46,11 @@ pub(crate) struct ArtifactInfo {
 }
 
 impl ArtifactInfo {
-    fn raw(base: usize) -> Self {
+    fn raw(base: usize, unreadable_pages: usize) -> Self {
         let mut info = Self::embedded(base, PeKind::Pe32Plus);
         info.embedded = false;
         info.raw_region = true;
+        info.unreadable_pages = unreadable_pages;
         info
     }
 
@@ -62,6 +65,7 @@ impl ArtifactInfo {
             cleared_directories: 0,
             invalid_unwind_entries: 0,
             imports_rebuilt: 0,
+            unresolved_delay: 0,
             ambiguous_imports: 0,
             renamed_sections: 0,
             tls_callbacks: 0,
@@ -74,6 +78,7 @@ impl ArtifactInfo {
             entry_unwind_covered: None,
             write_execute_sections: 0,
             never_decrypted_sections: 0,
+            absent_sections: 0,
             resident_pages: 0,
             private_pages: 0,
             unlinked: false,
@@ -101,6 +106,7 @@ pub(crate) struct DumpSummary {
     pub(crate) repaired_headers: usize,
     pub(crate) disk_header_repairs: usize,
     pub(crate) imports_rebuilt: usize,
+    pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) renamed_sections: usize,
@@ -114,6 +120,8 @@ pub(crate) struct DumpSummary {
     pub(crate) unlinked_images: usize,
     pub(crate) path_mismatches: usize,
     pub(crate) never_decrypted_sections: usize,
+    pub(crate) absent_sections: usize,
+    pub(crate) raw_region_unreadable_pages: usize,
     pub(crate) raw_regions: usize,
     pub(crate) embedded_pes: usize,
 }
@@ -126,6 +134,7 @@ pub(crate) struct BuildReport {
     export_stats: ExportStats,
     executable_non_image_allocations: usize,
     hidden_non_image_images: usize,
+    main_image_missing: bool,
 }
 
 pub(crate) struct DumpOutcome {
@@ -137,6 +146,7 @@ pub(crate) struct DumpOutcome {
     pub(crate) hidden_non_image_images: usize,
     pub(crate) main_rebuilt: bool,
     pub(crate) dll_failures: usize,
+    pub(crate) main_image_missing: bool,
 }
 
 impl BuildReport {
@@ -152,13 +162,14 @@ impl BuildReport {
             hidden_non_image_images: self.hidden_non_image_images,
             main_rebuilt: self.main_rebuilt,
             dll_failures: self.dll_failures,
+            main_image_missing: self.main_image_missing,
         })
     }
 }
 
 impl DumpOutcome {
     pub(crate) fn is_complete(&self) -> bool {
-        self.main_rebuilt && self.dll_failures == 0
+        self.main_rebuilt && self.dll_failures == 0 && !self.main_image_missing
     }
 
     pub(crate) fn has_warnings(&self) -> bool {
@@ -176,9 +187,12 @@ impl DumpOutcome {
             || self.summary.unlinked_images > 0
             || self.summary.path_mismatches > 0
             || self.summary.never_decrypted_sections > 0
+            || self.summary.absent_sections > 0
+            || self.summary.raw_region_unreadable_pages > 0
             || self.summary.raw_regions > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
+            || self.main_image_missing
             || self.executable_non_image_allocations > self.hidden_non_image_images
     }
 }
@@ -195,6 +209,9 @@ impl DumpSummary {
     fn add(&mut self, info: &ArtifactInfo) {
         if info.raw_region {
             self.raw_regions = self.raw_regions.saturating_add(1);
+            self.raw_region_unreadable_pages = self
+                .raw_region_unreadable_pages
+                .saturating_add(info.unreadable_pages);
             return;
         }
         if info.embedded {
@@ -214,6 +231,7 @@ impl DumpSummary {
             .disk_header_repairs
             .saturating_add(usize::from(info.disk_headers_used));
         self.imports_rebuilt = self.imports_rebuilt.saturating_add(info.imports_rebuilt);
+        self.unresolved_delay = self.unresolved_delay.saturating_add(info.unresolved_delay);
         self.ambiguous_imports = self
             .ambiguous_imports
             .saturating_add(info.ambiguous_imports);
@@ -244,6 +262,7 @@ impl DumpSummary {
         self.never_decrypted_sections = self
             .never_decrypted_sections
             .saturating_add(info.never_decrypted_sections);
+        self.absent_sections = self.absent_sections.saturating_add(info.absent_sections);
     }
 }
 
@@ -253,6 +272,7 @@ pub(crate) fn build(
     entry_point: Option<EntryPointRva>,
 ) -> BuildReport {
     let executable_non_image_allocations = capture.executable_non_image_allocations;
+    let main_image_missing = capture.main_image_missing;
     let hidden_non_image_images = capture.images.iter().filter(|image| image.hidden).count();
     let carve_regions = capture.carve_regions;
     let raw_regions = capture.raw_regions;
@@ -271,6 +291,7 @@ pub(crate) fn build(
         export_stats,
         executable_non_image_allocations,
         hidden_non_image_images,
+        main_image_missing,
     );
     if entry_point.is_some() && !images.iter().any(|image| image.is_main) {
         report.failures.push(BuildFailure {
@@ -326,7 +347,7 @@ fn push_raw_regions(regions: &[RawRegion], report: &mut BuildReport) {
         report.files.push(OutputFile {
             preferred_name: format!("region.{:016X}.{:X}.raw", region.base, bytes.len()),
             bytes,
-            context: ArtifactInfo::raw(region.base),
+            context: ArtifactInfo::raw(region.base, region.unreadable_pages),
         });
     }
 }
@@ -390,6 +411,7 @@ fn empty_report(
     export_stats: ExportStats,
     executable_non_image_allocations: usize,
     hidden_non_image_images: usize,
+    main_image_missing: bool,
 ) -> BuildReport {
     let captured_bases = images.iter().map(|image| image.base).collect::<Vec<_>>();
     let dll_failures = target
@@ -407,6 +429,7 @@ fn empty_report(
         export_stats,
         executable_non_image_allocations,
         hidden_non_image_images,
+        main_image_missing,
     }
 }
 
@@ -450,6 +473,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         cleared_directories: rebuilt.cleared_directories,
         invalid_unwind_entries: rebuilt.invalid_unwind_entries,
         imports_rebuilt: rebuilt.imports_rebuilt,
+        unresolved_delay: rebuilt.unresolved_delay,
         ambiguous_imports: rebuilt.ambiguous_imports,
         renamed_sections: rebuilt.renamed_sections,
         tls_callbacks: rebuilt.tls_callbacks,
@@ -462,6 +486,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         entry_unwind_covered: rebuilt.entry_unwind_covered,
         write_execute_sections: rebuilt.write_execute_sections,
         never_decrypted_sections: rebuilt.never_decrypted_sections,
+        absent_sections: rebuilt.absent_sections,
         resident_pages: image.resident_pages,
         private_pages: image.private_pages,
         unlinked: !image.linked && !image.hidden,
@@ -612,6 +637,7 @@ mod tests {
                 cleared_directories: 1,
                 invalid_unwind_entries: 0,
                 imports_rebuilt: imports,
+                unresolved_delay: 0,
                 ambiguous_imports: 0,
                 renamed_sections: 1,
                 tls_callbacks: 2,
@@ -624,6 +650,7 @@ mod tests {
                 entry_unwind_covered: None,
                 write_execute_sections: 0,
                 never_decrypted_sections: 0,
+                absent_sections: 0,
                 resident_pages: 8,
                 private_pages: 3,
                 unlinked: false,

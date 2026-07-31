@@ -257,6 +257,15 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
         "Imports",
         format_args!("{} recovered", outcome.summary.imports_rebuilt),
     );
+    if outcome.summary.unresolved_delay > 0 {
+        console.field(
+            "Delay",
+            format_args!(
+                "{} declared but not called yet",
+                outcome.summary.unresolved_delay
+            ),
+        );
+    }
     console.field(
         "TLS",
         format_args!("{} callbacks", outcome.summary.tls_callbacks),
@@ -276,6 +285,11 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
     }
     console.blank();
     console.section("WARNINGS");
+    if outcome.main_image_missing {
+        console.warning(format_args!(
+            "The main image was not present in the captured address space; every other module was still dumped"
+        ));
+    }
     render_repair_warnings(console, outcome);
     render_import_warnings(console, outcome);
     render_build_failures(console, outcome);
@@ -308,7 +322,7 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
     console.warning(format_args!("Notable directories cleared: {names}"));
 }
 
-fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 11] {
+fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 13] {
     [
         (summary.unreadable_pages, "Unreadable pages zero-filled"),
         (
@@ -343,6 +357,14 @@ fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str);
         (
             summary.never_decrypted_sections,
             "High-entropy sections never written after loading, so mempe's copy may still be encrypted",
+        ),
+        (
+            summary.raw_region_unreadable_pages,
+            "Unreadable pages zero-filled inside raw regions",
+        ),
+        (
+            summary.absent_sections,
+            "Executable sections that are entirely zero in the dump, so their real content was never captured",
         ),
         (
             summary.path_mismatches,

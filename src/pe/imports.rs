@@ -25,6 +25,8 @@ const DESCRIPTOR_FIRST_THUNK_OFFSET: usize = 16;
 const DESCRIPTOR_SCAN_STEP: usize = 4;
 const MAX_DESCRIPTOR_SCAN_STEPS: usize = 1_000_000;
 const MIN_AVERAGE_THUNKS: usize = 2;
+const ATTESTED_MINIMUM_ENTRIES: usize = 1;
+const SCANNED_MINIMUM_ENTRIES: usize = 2;
 const CALL_JUMP_LENGTH: usize = 6;
 const CALL_JUMP_PREFIX: u8 = 0xFF;
 const CALL_MODRM: u8 = 0x15;
@@ -52,6 +54,7 @@ pub(super) struct ImportPlan {
     pub(super) groups: Vec<ImportGroup>,
     pub(super) recovered: usize,
     pub(super) ambiguous: usize,
+    pub(super) unresolved_delay: usize,
     pub(super) existing: Vec<u8>,
 }
 
@@ -92,10 +95,20 @@ fn scan_trusted_ranges(
             .and_then(|(start, end)| {
                 let overlap_start = start.max(section_start);
                 let overlap_end = end.min(section_end);
-                (overlap_start < overlap_end).then_some((overlap_start, overlap_end))
+                (overlap_start < overlap_end).then_some((
+                    overlap_start,
+                    overlap_end,
+                    ATTESTED_MINIMUM_ENTRIES,
+                ))
             })
-            .or_else(|| is_import_section(section.name()).then_some((section_start, section_end)));
-        let Some((trusted_start, trusted_end)) = trusted_range else {
+            .or_else(|| {
+                is_import_section(section.name()).then_some((
+                    section_start,
+                    section_end,
+                    SCANNED_MINIMUM_ENTRIES,
+                ))
+            });
+        let Some((trusted_start, trusted_end, minimum)) = trusted_range else {
             continue;
         };
         let start = trusted_start as usize;
@@ -108,8 +121,11 @@ fn scan_trusted_ranges(
             observed_base,
             model.kind(),
             exports,
-            start,
-            end,
+            ImportScan {
+                start,
+                end,
+                minimum,
+            },
             plan,
         );
         if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
@@ -136,6 +152,7 @@ fn scan_delay_imports(
     let already_recovered = collect_recovered_slots(plan, width);
     let max_descriptors = (directory_size as usize / DELAY_DESCRIPTOR_SIZE).min(MAX_IMPORT_GROUPS);
     let mut budget = MAX_IMPORTS;
+    let mut unbound = 0usize;
     for index in 0..max_descriptors {
         if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
             break;
@@ -158,8 +175,43 @@ fn scan_delay_imports(
         if u32::try_from(start).is_ok_and(|slot| already_recovered.contains(&slot)) {
             continue;
         }
-        scan_import_range(memory, observed_base, kind, exports, start, end, plan);
+        let scan = ImportScan {
+            start,
+            end,
+            minimum: ATTESTED_MINIMUM_ENTRIES,
+        };
+        unbound = unbound.saturating_add(unbound_delay_slots(
+            memory,
+            observed_base,
+            kind,
+            exports,
+            &scan,
+        ));
+        scan_import_range(memory, observed_base, kind, exports, scan, plan);
     }
+    plan.unresolved_delay = plan.unresolved_delay.saturating_add(unbound);
+}
+
+fn unbound_delay_slots(
+    memory: &[u8],
+    observed_base: usize,
+    kind: PeKind,
+    exports: &ExportIndex,
+    scan: &ImportScan,
+) -> usize {
+    let width = kind.pointer_width();
+    let mut unbound = 0usize;
+    let mut offset = scan.start;
+    while offset.saturating_add(width) <= scan.end {
+        let Some(value) = read_pointer(memory, offset, width) else {
+            break;
+        };
+        if resolve_value(memory, observed_base, kind, value, exports).is_none() {
+            unbound = unbound.saturating_add(1);
+        }
+        offset = offset.saturating_add(width);
+    }
+    unbound
 }
 
 fn delay_table_range(
@@ -205,15 +257,25 @@ fn delay_table_length(
     None
 }
 
+struct ImportScan {
+    start: usize,
+    end: usize,
+    minimum: usize,
+}
+
 fn scan_import_range(
     memory: &[u8],
     observed_base: usize,
     kind: PeKind,
     exports: &ExportIndex,
-    start: usize,
-    end: usize,
+    scan: ImportScan,
     plan: &mut ImportPlan,
 ) {
+    let ImportScan {
+        start,
+        end,
+        minimum,
+    } = scan;
     let width = kind.pointer_width();
     let aligned_start = start.saturating_add((width - start % width) % width);
     let mut offset = aligned_start;
@@ -245,8 +307,8 @@ fn scan_import_range(
                 .and_then(|before| read_pointer(memory, before, width))
                 == Some(0);
         let ends_cleanly = read_pointer(memory, offset, width) == Some(0) || offset == end;
-        if entries.len() >= 2 && starts_cleanly && ends_cleanly {
-            append_groups(entries, width, 2, plan);
+        if entries.len() >= minimum && starts_cleanly && ends_cleanly {
+            append_groups(entries, width, minimum, plan);
         }
         if offset == run_start {
             offset = offset.saturating_add(width);
@@ -727,6 +789,42 @@ mod tests {
     use crate::pe::{ExportIndex, PeKind, rebuild};
 
     #[test]
+    fn recovers_a_lone_import_when_the_iat_directory_attests_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
+        put_u32(&mut target, 0x98 + 112 + 12 * 8, 0x2000);
+        put_u32(&mut target, 0x98 + 112 + 12 * 8 + 4, 8);
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
+
+        assert_eq!(plan.recovered, 1);
+        assert_eq!(plan.groups.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn still_rejects_a_lone_import_with_only_a_section_name_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
+
+        assert_eq!(plan.recovered, 0);
+        assert!(plan.groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn finds_two_adjacent_resolved_imports() -> Result<(), Box<dyn std::error::Error>> {
         let export_base = 0x0000_7FFB_0000_0000usize;
         let export_image = fixture_pe64(true);
@@ -972,7 +1070,7 @@ mod tests {
 
     fn delay_fixture() -> Vec<u8> {
         let mut memory = vec![0u8; 0x200];
-        memory[0x30..0x34].copy_from_slice(b"a.d ");
+        memory[0x30..0x34].copy_from_slice(b"a.d\0");
         put_u64(&mut memory, 0x40, 0x1111);
         put_u64(&mut memory, 0x48, 0x2222);
         put_u64(&mut memory, 0x60, 0x3333);
@@ -1025,7 +1123,7 @@ mod tests {
 
     fn descriptor_array_fixture(thunks: usize) -> Vec<u8> {
         let mut memory = vec![0u8; 0x400];
-        memory[0x100..0x104].copy_from_slice(b"a.d ");
+        memory[0x100..0x104].copy_from_slice(b"a.d\0");
         let descriptor = 0x200usize;
         memory[descriptor..descriptor + 4].copy_from_slice(&0x120u32.to_le_bytes());
         memory[descriptor + 12..descriptor + 16].copy_from_slice(&0x100u32.to_le_bytes());

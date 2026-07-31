@@ -46,6 +46,7 @@ const PAGE_RESIDENT: u8 = 0b01;
 const PAGE_PRIVATE: u8 = 0b10;
 const HIGH_ENTROPY_THRESHOLD: f64 = 7.2;
 const MIN_ENTROPY_SECTION_BYTES: usize = 1024;
+const MIN_ABSENT_SECTION_BYTES: usize = 1024;
 const ENTROPY_ALPHABET: usize = 256;
 const BOUND_IMPORT_DIRECTORY: usize = 11;
 const DIRECTORY_COUNT: usize = 16;
@@ -83,6 +84,7 @@ pub(crate) struct RebuiltImage {
     pub(crate) cleared_directories: usize,
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) imports_rebuilt: usize,
+    pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
@@ -95,6 +97,7 @@ pub(crate) struct RebuiltImage {
     pub(crate) entry_unwind_covered: Option<bool>,
     pub(crate) write_execute_sections: usize,
     pub(crate) never_decrypted_sections: usize,
+    pub(crate) absent_sections: usize,
 }
 
 struct SectionLayout<'a> {
@@ -146,6 +149,7 @@ pub(crate) fn rebuild(
         notable_cleared_directories: names_to_strings(&repairs.cleared.notable),
         invalid_unwind_entries: repairs.invalid_unwind_entries,
         imports_rebuilt: if written { import_plan.recovered } else { 0 },
+        unresolved_delay: import_plan.unresolved_delay,
         ambiguous_imports: import_plan.ambiguous,
         renamed_sections,
         tls_callbacks: count_tls_callbacks(&image, observed_base),
@@ -157,6 +161,7 @@ pub(crate) fn rebuild(
         entry_unwind_covered: entry_unwind_covered(&repairs.unwind_ranges, final_entry_point),
         write_execute_sections: count_write_execute_sections(&layouts, regions),
         never_decrypted_sections: never_decrypted_sections(memory, &layouts, page_flags),
+        absent_sections: absent_sections(memory, &layouts),
     })
 }
 
@@ -1050,6 +1055,27 @@ fn count_write_execute_sections(
             })
         })
         .count()
+}
+
+fn absent_sections(memory: &[u8], layouts: &[SectionLayout<'_>]) -> usize {
+    layouts
+        .iter()
+        .filter(|layout| section_absent(memory, layout))
+        .count()
+}
+
+fn section_absent(memory: &[u8], layout: &SectionLayout<'_>) -> bool {
+    if layout.model.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+        return false;
+    }
+    if layout.source_length < MIN_ABSENT_SECTION_BYTES {
+        return false;
+    }
+    let start = layout.model.virtual_address.get() as usize;
+    let Some(slice) = memory.get(start..start.saturating_add(layout.source_length)) else {
+        return false;
+    };
+    slice.iter().all(|byte| *byte == 0)
 }
 
 fn never_decrypted_sections(

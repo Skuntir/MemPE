@@ -97,11 +97,13 @@ pub(crate) struct Capture {
     pub(crate) executable_non_image_allocations: usize,
     pub(crate) carve_regions: Vec<RawRegion>,
     pub(crate) raw_regions: Vec<RawRegion>,
+    pub(crate) main_image_missing: bool,
 }
 
 pub(crate) struct RawRegion {
     pub(crate) base: usize,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) unreadable_pages: usize,
 }
 
 pub(crate) struct StabilityInfo {
@@ -262,6 +264,7 @@ pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Ca
         executable_non_image_allocations: captured.non_image_count,
         carve_regions: captured.carve_regions,
         raw_regions: captured.raw_regions,
+        main_image_missing: captured.main_image_missing,
     })
 }
 
@@ -360,6 +363,7 @@ struct CapturedSpace {
     non_image_count: usize,
     carve_regions: Vec<RawRegion>,
     raw_regions: Vec<RawRegion>,
+    main_image_missing: bool,
 }
 
 fn capture_from_space(
@@ -398,11 +402,12 @@ fn capture_from_space(
         let image_regions = regions_in_range(&regions, base, size)?;
         images.push(read_image(space, target, base, size, &image_regions, true)?);
     }
-    if !images.iter().any(|image| image.is_main) {
+    if images.is_empty() {
         return Err(AppError::new(
-            "the main image allocation was not present in the captured address space",
+            "no image allocations were present in the captured address space",
         ));
     }
+    let main_image_missing = main_image_is_missing(&images);
     let carve_allocations = readable_non_image_allocations(space, &regions, &non_image_allocations);
     let carve_regions =
         read_allocations(space, &regions, &carve_allocations, MAX_NON_IMAGE_RW_BYTES);
@@ -417,7 +422,12 @@ fn capture_from_space(
         non_image_count,
         carve_regions,
         raw_regions,
+        main_image_missing,
     })
+}
+
+fn main_image_is_missing(images: &[CapturedImage]) -> bool {
+    !images.iter().any(|image| image.is_main)
 }
 
 fn readable_non_image_allocations(
@@ -490,9 +500,13 @@ fn read_allocations(
             break;
         }
         bytes.resize(size, 0);
-        let _unreadable = read_region(space, base, &mut bytes);
+        let unreadable_pages = read_region(space, base, &mut bytes);
         remaining = remaining.saturating_sub(size);
-        collected.push(RawRegion { base, bytes });
+        collected.push(RawRegion {
+            base,
+            bytes,
+            unreadable_pages,
+        });
     }
     collected
 }
@@ -998,9 +1012,48 @@ mod tests {
     };
 
     use super::{
-        MAX_STABILITY_READS, MemoryRegion, PAGE_SIZE, allocation_extents, basename_mismatch,
-        executable_non_image_allocations, regions_in_range, stability_pages,
+        CapturedImage, MAX_STABILITY_READS, MemoryRegion, PAGE_SIZE, allocation_extents,
+        basename_mismatch, executable_non_image_allocations, main_image_is_missing,
+        regions_in_range, stability_pages,
     };
+
+    fn captured_image(is_main: bool) -> CapturedImage {
+        CapturedImage {
+            base: 0,
+            bytes: Vec::new(),
+            regions: Vec::new(),
+            unreadable_pages: 0,
+            name: None,
+            path: None,
+            is_main,
+            hidden: false,
+            linked: true,
+            image_backed: true,
+            path_mismatch: false,
+            resident_pages: 0,
+            private_pages: 0,
+            page_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn main_image_missing_is_false_when_the_main_image_was_captured() {
+        let images = vec![captured_image(false), captured_image(true)];
+
+        assert!(!main_image_is_missing(&images));
+    }
+
+    #[test]
+    fn main_image_missing_is_true_when_only_other_images_were_captured() {
+        let images = vec![captured_image(false), captured_image(false)];
+
+        assert!(main_image_is_missing(&images));
+    }
+
+    #[test]
+    fn main_image_missing_is_true_for_an_empty_capture() {
+        assert!(main_image_is_missing(&[]));
+    }
 
     fn region(base: usize, size: usize) -> MemoryRegion {
         MemoryRegion {

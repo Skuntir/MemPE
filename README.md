@@ -18,6 +18,7 @@ Use it for reverse engineering and unpacking. mempe is a dumper, not a malware s
 - Converts in-memory sections back to a normal file layout
 - Adds observed section access flags and recovers nonzero runtime data beyond damaged section bounds
 - Recovers imports from the existing descriptor table, from delay-load directory 13, from trusted IAT ranges, and from direct x86/x64 call sites
+- Counts delay-load slots the program has declared but not called yet, so an unresolved slot is reported rather than quietly missing
 - Handles named exports, ordinal exports, forwarded exports, and common API-set forwarders
 - Merges damaged headers with validated structural evidence from the original file, but only when the memory is still backed by that file
 - Recalculates derived optional-header sizes and the PE checksum from the final rebuilt bytes
@@ -112,6 +113,8 @@ Two lines describe what mempe observed rather than what it changed. The entry li
 
 mempe also warns when an executable section is high-entropy but shows no sign of having been written since the image was mapped. That combination usually means the section was still encrypted when the snapshot was taken, so the copy in the dump is not real code. The warning is about mempe's own output, not about the target.
 
+A separate warning covers the more extreme case: an executable section that is entirely zero in the dump. That means the section was never populated at capture time, so the file contains nothing real for it. Dumping a packed target too early is the usual cause, and re-running after the program has settled normally fixes it.
+
 ## Building
 
 mempe requires Windows 10 or later. Build it with the stable Rust toolchain:
@@ -140,10 +143,11 @@ mempe needs permission to open and read the target process. An elevated target m
 ## Limitations
 
 - Import recovery depends on the IAT and on the exports available in the captured process. Packed files, custom loaders, API hashing, and unusual thunk layouts may leave imports unresolved.
-- A delay-load slot that has never been called still points at its own stub, so it cannot be resolved. Delay imports are only recovered once the program has used them.
+- A delay-load slot that has never been called still points at its own stub, so its target cannot be recovered. mempe counts those slots and reports them separately rather than dropping them silently.
 - Hidden images are found by looking for page-aligned PE headers. Headerless payloads and raw shellcode are only written with `--raw-regions`, and then as plain bytes with no reconstructed header.
 - Unreadable memory is replaced with zeroes. The warning count tells you how much data was lost.
-- The entropy warning cannot see a section that was never faulted in at all. It only fires on sections that are resident and unwritten.
+- The entropy warning only fires on sections that are resident and unwritten. A section that was never faulted in at all is reported by the separate all-zero warning instead.
+- If the main image has been unmapped from the target, mempe dumps every other module and reports the missing main image rather than failing outright. The result is a partial dump and exit code 3.
 - A structurally valid PE is useful for static analysis, but it may still need manual work before it can run.
 - Only x86 and x64 Windows PE images are supported.
 

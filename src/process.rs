@@ -346,12 +346,35 @@ fn module_from_entry(entry: &MODULEENTRY32W) -> ModuleInfo {
 }
 
 fn find_main_module(path: &Path, modules: &[ModuleInfo]) -> AppResult<ModuleInfo> {
-    modules
+    if modules.is_empty() {
+        return Err(AppError::new("target has no modules"));
+    }
+    if let Some(module) = modules
         .iter()
         .find(|module| paths_equal(&module.path, path))
-        .or_else(|| modules.first())
-        .cloned()
-        .ok_or_else(|| AppError::new("target has no modules"))
+        .or_else(|| find_by_basename(path, modules))
+    {
+        return Ok(module.clone());
+    }
+    Err(AppError::new(format!(
+        "no loaded module matches the target image {}; refusing to guess which of the {} mapped \
+         modules is the main image",
+        path.display(),
+        modules.len()
+    )))
+}
+
+fn find_by_basename<'a>(path: &Path, modules: &'a [ModuleInfo]) -> Option<&'a ModuleInfo> {
+    let wanted = path.file_name()?.to_str()?;
+    let mut matches = modules.iter().filter(|module| {
+        module
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -373,4 +396,68 @@ fn filetime_value(value: FILETIME) -> u64 {
 
 fn windows_error(action: &str, error: windows::core::Error) -> AppError {
     AppError::new(format!("{action} failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{ModuleInfo, find_main_module};
+
+    fn module(name: &str, dir: &str) -> ModuleInfo {
+        ModuleInfo {
+            name: name.to_owned(),
+            path: PathBuf::from(dir).join(name),
+            base: 0x1000,
+            size: 0x1000,
+        }
+    }
+
+    #[test]
+    fn matches_the_exact_reported_path() -> Result<(), Box<dyn std::error::Error>> {
+        let target = PathBuf::from(r"C:\apps\a.exe");
+        let modules = vec![module("a.exe", r"C:\other"), module("a.exe", r"C:\apps")];
+
+        let found = find_main_module(&target, &modules)?;
+
+        assert_eq!(found.path, PathBuf::from(r"C:\apps\a.exe"));
+        Ok(())
+    }
+
+    #[test]
+    fn falls_back_to_a_unique_basename_match() -> Result<(), Box<dyn std::error::Error>> {
+        let target = PathBuf::from(r"C:\renamed\a.exe");
+        let modules = vec![
+            module("a.exe", r"C:\original"),
+            module("b.dll", r"C:\original"),
+        ];
+
+        let found = find_main_module(&target, &modules)?;
+
+        assert_eq!(found.name, "a.exe");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_to_guess_between_two_modules_with_the_same_basename() {
+        let target = PathBuf::from(r"C:\renamed\a.exe");
+        let modules = vec![module("a.exe", r"C:\one"), module("a.exe", r"C:\two")];
+
+        assert!(find_main_module(&target, &modules).is_err());
+    }
+
+    #[test]
+    fn refuses_to_guess_when_nothing_matches() {
+        let target = PathBuf::from(r"C:\renamed\a.exe");
+        let modules = vec![module("unrelated.dll", r"C:\one")];
+
+        assert!(find_main_module(&target, &modules).is_err());
+    }
+
+    #[test]
+    fn refuses_an_empty_module_list() {
+        let target = PathBuf::from(r"C:\renamed\a.exe");
+
+        assert!(find_main_module(&target, &[]).is_err());
+    }
 }
