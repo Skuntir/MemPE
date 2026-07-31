@@ -46,6 +46,10 @@ const MAX_MAPPED_PATH_CHARS: usize = 1_024;
 const WORKING_SET_CHUNK: usize = 512;
 const WORKING_SET_VALID: usize = 1;
 const WORKING_SET_SHARED: usize = 1 << 15;
+const MAX_NON_IMAGE_RW_BYTES: usize = 256 * 1024 * 1024;
+const MAX_RAW_REGION_BYTES: usize = 512 * 1024 * 1024;
+const PAGE_RESIDENT: u8 = 0b01;
+const PAGE_PRIVATE: u8 = 0b10;
 
 pub(crate) enum AcquisitionMode {
     PssClone,
@@ -71,14 +75,18 @@ pub(crate) struct CapturedImage {
     pub(crate) is_main: bool,
     pub(crate) hidden: bool,
     pub(crate) linked: bool,
+    pub(crate) image_backed: bool,
+    pub(crate) path_mismatch: bool,
     pub(crate) resident_pages: usize,
     pub(crate) private_pages: usize,
+    pub(crate) page_flags: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct PageCoverage {
     resident: usize,
     private: usize,
+    flags: Vec<u8>,
 }
 
 pub(crate) struct Capture {
@@ -87,6 +95,13 @@ pub(crate) struct Capture {
     pub(crate) fallback_reason: Option<String>,
     pub(crate) images: Vec<CapturedImage>,
     pub(crate) executable_non_image_allocations: usize,
+    pub(crate) carve_regions: Vec<RawRegion>,
+    pub(crate) raw_regions: Vec<RawRegion>,
+}
+
+pub(crate) struct RawRegion {
+    pub(crate) base: usize,
+    pub(crate) bytes: Vec<u8>,
 }
 
 pub(crate) struct StabilityInfo {
@@ -224,26 +239,29 @@ impl AddressSpace {
     }
 }
 
-pub(crate) fn capture(target: &TargetProcess) -> AppResult<Capture> {
-    let coverage = measure_image_pages(target);
+pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Capture> {
+    let mut coverage = measure_image_pages(target);
     let AcquiredAddressSpace {
         space,
         mode,
         setup_elapsed,
         fallback_reason,
     } = AddressSpace::acquire(target)?;
-    let (mut images, non_image_count) = capture_from_space(&space, target)?;
+    let captured = capture_from_space(&space, target, raw_regions)?;
+    let mut images = captured.images;
     drop(space);
     if let Ok(process) = OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
     {
-        annotate_images(process.raw(), &mut images, &coverage);
+        annotate_images(process.raw(), &mut images, &mut coverage);
     }
     Ok(Capture {
         mode,
         setup_elapsed,
         fallback_reason,
         images,
-        executable_non_image_allocations: non_image_count,
+        executable_non_image_allocations: captured.non_image_count,
+        carve_regions: captured.carve_regions,
+        raw_regions: captured.raw_regions,
     })
 }
 
@@ -337,10 +355,18 @@ fn is_stability_region(region: &MemoryRegion) -> bool {
             || is_executable(region.protect))
 }
 
+struct CapturedSpace {
+    images: Vec<CapturedImage>,
+    non_image_count: usize,
+    carve_regions: Vec<RawRegion>,
+    raw_regions: Vec<RawRegion>,
+}
+
 fn capture_from_space(
     space: &AddressSpace,
     target: &TargetProcess,
-) -> AppResult<(Vec<CapturedImage>, usize)> {
+    want_raw_regions: bool,
+) -> AppResult<CapturedSpace> {
     let regions = space.regions()?;
     let non_image_allocations = executable_non_image_allocations(&regions);
     let non_image_count = non_image_allocations.len();
@@ -367,7 +393,7 @@ fn capture_from_space(
             false,
         )?);
     }
-    for (base, size) in hidden {
+    for (base, size) in hidden.iter().copied() {
         add_image_size(&mut total_size, size)?;
         let image_regions = regions_in_range(&regions, base, size)?;
         images.push(read_image(space, target, base, size, &image_regions, true)?);
@@ -377,7 +403,98 @@ fn capture_from_space(
             "the main image allocation was not present in the captured address space",
         ));
     }
-    Ok((images, non_image_count))
+    let carve_allocations = readable_non_image_allocations(space, &regions, &non_image_allocations);
+    let carve_regions =
+        read_allocations(space, &regions, &carve_allocations, MAX_NON_IMAGE_RW_BYTES);
+    let raw_regions = if want_raw_regions {
+        let unclaimed = unclaimed_executable_allocations(&regions, &non_image_allocations, &hidden);
+        read_allocations(space, &regions, &unclaimed, MAX_RAW_REGION_BYTES)
+    } else {
+        Vec::new()
+    };
+    Ok(CapturedSpace {
+        images,
+        non_image_count,
+        carve_regions,
+        raw_regions,
+    })
+}
+
+fn readable_non_image_allocations(
+    space: &AddressSpace,
+    regions: &[MemoryRegion],
+    executable: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    let candidates = regions
+        .iter()
+        .filter(|region| {
+            region.state == MEM_COMMIT.0
+                && region.kind != MEM_IMAGE.0
+                && region.allocation_base != 0
+                && is_readable(region.protect)
+                && !is_executable(region.protect)
+        })
+        .map(|region| region.allocation_base)
+        .filter(|base| !executable.contains(base))
+        .collect::<BTreeSet<usize>>();
+    candidates
+        .into_iter()
+        .filter(|base| mapped_file_name(space.handle(), *base).is_none())
+        .collect()
+}
+
+fn unclaimed_executable_allocations(
+    regions: &[MemoryRegion],
+    executable: &BTreeSet<usize>,
+    hidden: &[(usize, usize)],
+) -> BTreeSet<usize> {
+    let mut claimed = BTreeSet::new();
+    for (base, _size) in hidden {
+        if let Some(region) = regions.iter().find(|region| region.base == *base) {
+            claimed.insert(region.allocation_base);
+        }
+    }
+    executable
+        .iter()
+        .copied()
+        .filter(|base| !claimed.contains(base))
+        .collect()
+}
+
+fn read_allocations(
+    space: &AddressSpace,
+    regions: &[MemoryRegion],
+    allocations: &BTreeSet<usize>,
+    budget: usize,
+) -> Vec<RawRegion> {
+    let mut extents = BTreeMap::<usize, usize>::new();
+    for region in regions {
+        if region.state != MEM_COMMIT.0 || !allocations.contains(&region.allocation_base) {
+            continue;
+        }
+        let end = region.base.saturating_add(region.size);
+        extents
+            .entry(region.allocation_base)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
+    }
+    let mut remaining = budget;
+    let mut collected = Vec::new();
+    for (base, end) in extents.into_iter().take(MAX_IMAGES) {
+        let size = end.saturating_sub(base).min(remaining);
+        if size == 0 {
+            break;
+        }
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(size).is_err() {
+            break;
+        }
+        bytes.resize(size, 0);
+        let _unreadable = read_region(space, base, &mut bytes);
+        remaining = remaining.saturating_sub(size);
+        collected.push(RawRegion { base, bytes });
+    }
+    collected
 }
 
 fn add_image_size(total: &mut usize, size: usize) -> AppResult<()> {
@@ -467,6 +584,12 @@ fn group_images(
     Ok(groups)
 }
 
+struct RegionScan {
+    evidence: Vec<RegionEvidence>,
+    unreadable_pages: usize,
+    image_backed: bool,
+}
+
 fn read_image(
     space: &AddressSpace,
     target: &TargetProcess,
@@ -480,15 +603,45 @@ fn read_image(
         .try_reserve_exact(size)
         .map_err(|_| AppError::new(format!("not enough memory for image at 0x{base:016X}")))?;
     bytes.resize(size, 0);
-    let mut evidence = Vec::with_capacity(regions.len());
-    let mut unreadable_pages = 0usize;
     let image_end = base
         .checked_add(size)
         .ok_or_else(|| AppError::new("image address overflowed"))?;
+    let scan = read_image_regions(space, &mut bytes, base, image_end, regions)?;
+    let module = target.modules.iter().find(|module| module.base == base);
+    Ok(CapturedImage {
+        base,
+        bytes,
+        regions: scan.evidence,
+        unreadable_pages: scan.unreadable_pages,
+        name: module.map(|value| value.name.clone()),
+        path: module.map(|value| value.path.clone()),
+        is_main: base == target.main_module.base,
+        hidden,
+        linked: module.is_some(),
+        image_backed: scan.image_backed,
+        path_mismatch: false,
+        resident_pages: 0,
+        private_pages: 0,
+        page_flags: Vec::new(),
+    })
+}
 
+fn read_image_regions(
+    space: &AddressSpace,
+    bytes: &mut [u8],
+    base: usize,
+    image_end: usize,
+    regions: &[MemoryRegion],
+) -> AppResult<RegionScan> {
+    let mut evidence = Vec::with_capacity(regions.len());
+    let mut unreadable_pages = 0usize;
+    let mut image_backed = true;
     for region in regions {
         if region.state != MEM_COMMIT.0 {
             continue;
+        }
+        if region.kind != MEM_IMAGE.0 {
+            image_backed = false;
         }
         let region_end = region
             .base
@@ -518,20 +671,10 @@ fn read_image(
         unreadable_pages =
             unreadable_pages.saturating_add(read_region(space, read_base, destination));
     }
-
-    let module = target.modules.iter().find(|module| module.base == base);
-    Ok(CapturedImage {
-        base,
-        bytes,
-        regions: evidence,
+    Ok(RegionScan {
+        evidence,
         unreadable_pages,
-        name: module.map(|value| value.name.clone()),
-        path: module.map(|value| value.path.clone()),
-        is_main: base == target.main_module.base,
-        hidden,
-        linked: module.is_some(),
-        resident_pages: 0,
-        private_pages: 0,
+        image_backed,
     })
 }
 
@@ -568,16 +711,26 @@ fn measure_image_pages(target: &TargetProcess) -> BTreeMap<usize, PageCoverage> 
 fn annotate_images(
     process: HANDLE,
     images: &mut [CapturedImage],
-    coverage: &BTreeMap<usize, PageCoverage>,
+    coverage: &mut BTreeMap<usize, PageCoverage>,
 ) {
     for image in images {
-        if image.name.is_none() {
-            image.name = mapped_file_name(process, image.base);
+        let mapped = mapped_file_name(process, image.base);
+        image.path_mismatch = basename_mismatch(image.name.as_deref(), mapped.as_deref());
+        if image.name.is_none() || image.path_mismatch {
+            image.name = mapped;
         }
-        if let Some(pages) = coverage.get(&image.base) {
+        if let Some(pages) = coverage.remove(&image.base) {
             image.resident_pages = pages.resident;
             image.private_pages = pages.private;
+            image.page_flags = pages.flags;
         }
+    }
+}
+
+fn basename_mismatch(reported: Option<&str>, mapped: Option<&str>) -> bool {
+    match (reported, mapped) {
+        (Some(reported), Some(mapped)) => !reported.eq_ignore_ascii_case(mapped),
+        _ => false,
     }
 }
 
@@ -593,6 +746,7 @@ fn mapped_file_name(process: HANDLE, base: usize) -> Option<String> {
 fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
     let mut coverage = PageCoverage::default();
     let pages = size.div_ceil(PAGE_SIZE);
+    coverage.flags.resize(pages, 0);
     let mut first = 0usize;
     while first < pages {
         let count = pages.saturating_sub(first).min(WORKING_SET_CHUNK);
@@ -609,15 +763,20 @@ fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
         if !unsafe { K32QueryWorkingSetEx(process, entries.as_mut_ptr().cast(), bytes) }.as_bool() {
             break;
         }
-        for entry in entries.iter().take(count) {
+        for (slot, entry) in entries.iter().take(count).enumerate() {
             // SAFETY: Flags is the integer view of the union and every bit pattern is valid.
             let flags = unsafe { entry.VirtualAttributes.Flags };
             if flags & WORKING_SET_VALID == 0 {
                 continue;
             }
             coverage.resident = coverage.resident.saturating_add(1);
+            let mut bits = PAGE_RESIDENT;
             if flags & WORKING_SET_SHARED == 0 {
                 coverage.private = coverage.private.saturating_add(1);
+                bits |= PAGE_PRIVATE;
+            }
+            if let Some(page) = coverage.flags.get_mut(first.saturating_add(slot)) {
+                *page = bits;
             }
         }
         first = first.saturating_add(count);
@@ -630,21 +789,7 @@ fn find_hidden_images(
     regions: &[MemoryRegion],
     executable_allocations: &BTreeSet<usize>,
 ) -> AppResult<Vec<(usize, usize)>> {
-    let mut allocation_ends = BTreeMap::<usize, usize>::new();
-    for region in regions {
-        if !executable_allocations.contains(&region.allocation_base) {
-            continue;
-        }
-        let end = region
-            .base
-            .checked_add(region.size)
-            .ok_or_else(|| AppError::new("non-image allocation address overflowed"))?;
-        allocation_ends
-            .entry(region.allocation_base)
-            .and_modify(|current| *current = (*current).max(end))
-            .or_insert(end);
-    }
-
+    let allocation_ends = allocation_extents(regions, executable_allocations)?;
     let mut found = Vec::new();
     let mut captured_allocations = BTreeSet::new();
     let mut scanned_pages = 0usize;
@@ -656,6 +801,9 @@ fn find_hidden_images(
         {
             continue;
         }
+        let Some(allocation_end) = allocation_ends.get(&region.allocation_base).copied() else {
+            continue;
+        };
         for offset in (0..region.size).step_by(PAGE_SIZE) {
             scanned_pages = scanned_pages.saturating_add(1);
             if scanned_pages > MAX_NON_IMAGE_SCAN_PAGES {
@@ -666,28 +814,9 @@ fn find_hidden_images(
             let Some(base) = region.base.checked_add(offset) else {
                 return Err(AppError::new("non-image PE scan address overflowed"));
             };
-            let mut magic = [0u8; 2];
-            if !space.read_exact(base, &mut magic) || magic != *b"MZ" {
-                continue;
-            }
-            let Some(allocation_end) = allocation_ends.get(&region.allocation_base).copied() else {
+            let Some(available) = hidden_image_at(space, base, allocation_end) else {
                 continue;
             };
-            let available = allocation_end.saturating_sub(base);
-            let header_length = available.min(MAX_HEADER_READ);
-            let mut header = vec![0u8; header_length];
-            if !space.read_exact(base, &mut header) {
-                continue;
-            }
-            let Ok(image_size) = crate::pe::memory_image_size(&header) else {
-                continue;
-            };
-            if image_size > available {
-                continue;
-            }
-            if available > MAX_IMAGE_SIZE {
-                continue;
-            }
             found.push((base, available));
             captured_allocations.insert(region.allocation_base);
             if found.len() > MAX_IMAGES {
@@ -699,6 +828,43 @@ fn find_hidden_images(
         }
     }
     Ok(found)
+}
+
+fn allocation_extents(
+    regions: &[MemoryRegion],
+    executable_allocations: &BTreeSet<usize>,
+) -> AppResult<BTreeMap<usize, usize>> {
+    let mut ends = BTreeMap::<usize, usize>::new();
+    for region in regions {
+        if !executable_allocations.contains(&region.allocation_base) {
+            continue;
+        }
+        let end = region
+            .base
+            .checked_add(region.size)
+            .ok_or_else(|| AppError::new("non-image allocation address overflowed"))?;
+        ends.entry(region.allocation_base)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
+    }
+    Ok(ends)
+}
+
+fn hidden_image_at(space: &AddressSpace, base: usize, allocation_end: usize) -> Option<usize> {
+    let mut magic = [0u8; 2];
+    if !space.read_exact(base, &mut magic) || magic != *b"MZ" {
+        return None;
+    }
+    let available = allocation_end.saturating_sub(base);
+    if available > MAX_IMAGE_SIZE {
+        return None;
+    }
+    let mut header = vec![0u8; available.min(MAX_HEADER_READ)];
+    if !space.read_exact(base, &mut header) {
+        return None;
+    }
+    let image_size = crate::pe::memory_image_size(&header).ok()?;
+    (image_size <= available).then_some(available)
 }
 
 fn regions_in_range(
@@ -832,8 +998,8 @@ mod tests {
     };
 
     use super::{
-        MAX_STABILITY_READS, MemoryRegion, PAGE_SIZE, executable_non_image_allocations,
-        regions_in_range, stability_pages,
+        MAX_STABILITY_READS, MemoryRegion, PAGE_SIZE, allocation_extents, basename_mismatch,
+        executable_non_image_allocations, regions_in_range, stability_pages,
     };
 
     fn region(base: usize, size: usize) -> MemoryRegion {
@@ -932,5 +1098,33 @@ mod tests {
         assert_eq!(allocations.len(), 2);
         assert!(allocations.contains(&0x1000));
         assert!(allocations.contains(&0x2000));
+    }
+
+    #[test]
+    fn only_flags_a_mismatch_when_both_names_are_known() {
+        assert!(!basename_mismatch(Some("ntdll.dll"), Some("ntdll.dll")));
+        assert!(!basename_mismatch(Some("NTDLL.DLL"), Some("ntdll.dll")));
+        assert!(basename_mismatch(Some("kernel32.dll"), Some("notepad.exe")));
+        assert!(!basename_mismatch(None, Some("ntdll.dll")));
+        assert!(!basename_mismatch(Some("ntdll.dll"), None));
+        assert!(!basename_mismatch(None, None));
+    }
+
+    #[test]
+    fn allocation_extents_take_the_furthest_end_per_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut first = region(0x1000, PAGE_SIZE);
+        first.allocation_base = 0x1000;
+        let mut second = region(0x1000 + PAGE_SIZE, PAGE_SIZE * 3);
+        second.allocation_base = 0x1000;
+        let mut other = region(0x9000, PAGE_SIZE);
+        other.allocation_base = 0x9000;
+        let executable = [0x1000usize, 0x9000].into_iter().collect();
+
+        let extents = allocation_extents(&[first, second, other], &executable)?;
+
+        assert_eq!(extents.get(&0x1000).copied(), Some(0x1000 + PAGE_SIZE * 4));
+        assert_eq!(extents.get(&0x9000).copied(), Some(0x9000 + PAGE_SIZE));
+        Ok(())
     }
 }

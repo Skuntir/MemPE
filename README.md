@@ -4,7 +4,7 @@
 
 # mempe
 
-mempe dumps Windows executables and DLLs from a running process, then rebuilds each image into a file that regular PE tools can parse. It also checks executable non-image memory for manually mapped PEs.
+mempe dumps Windows executables and DLLs from a running process, then rebuilds each image into a file that regular PE tools can parse. It also checks non-image memory for manually mapped and embedded PEs.
 
 Use it for reverse engineering and unpacking. mempe is a dumper, not a malware scanner, and its output is meant for analysis rather than execution.
 
@@ -14,14 +14,16 @@ Use it for reverse engineering and unpacking. mempe is a dumper, not a malware s
 - Accepts a PID or waits for a new process with a given name
 - Checks distributed executable and writable-image page samples for stability before a watched dump
 - Finds loader-mapped modules and page-aligned PEs in executable non-image memory
+- Carves embedded PEs out of captured images and out of readable non-image memory, including drivers and .NET assemblies loaded from a byte array
 - Converts in-memory sections back to a normal file layout
 - Adds observed section access flags and recovers nonzero runtime data beyond damaged section bounds
-- Recovers imports by matching IAT entries and direct x86/x64 IAT call sites against exports from captured modules
+- Recovers imports from the existing descriptor table, from delay-load directory 13, from trusted IAT ranges, and from direct x86/x64 call sites
 - Handles named exports, ordinal exports, forwarded exports, and common API-set forwarders
-- Merges damaged headers with validated structural evidence from the original file when available
-- Recalculates derived optional-header sizes from the final rebuilt section table
+- Merges damaged headers with validated structural evidence from the original file, but only when the memory is still backed by that file
+- Recalculates derived optional-header sizes and the PE checksum from the final rebuilt bytes
 - Accepts a validated manual entry-point RVA for unpacked main images
 - Clears directories that no longer point to valid data and removes broken x64 unwind entries
+- Reports what it observed about the entry point and about sections it may not have captured in a decrypted state
 - Zero-fills unreadable pages and reports them in the final summary
 
 ## Usage
@@ -54,19 +56,61 @@ mempe.exe -p 4216 --entry-point 0x31A20
 
 The value is an RVA, not a virtual address. mempe rejects it unless it lies inside a captured executable section.
 
+Also write the raw bytes of executable memory that held no complete PE:
+
+```text
+mempe.exe -p 4216 --raw-regions
+```
+
+This is off by default because it can add a lot of files. Use it when you are looking for headerless payloads or shellcode that the PE carver will not pick up.
+
 Show the built-in help:
 
 ```text
 mempe.exe -h
 ```
 
+## How a dump is rebuilt
+
+Reading the code in execution order is the fastest way to understand it. There are four stages.
+
+**1. Capture** (`src/memory.rs`)
+
+Working-set page state is measured first, in `measure_image_pages`, before anything else touches the process. This ordering matters: taking a PSS snapshot marks every page copy-on-write, which destroys the private-page signal mempe uses later to tell decrypted memory from memory that was never written.
+
+`AddressSpace::acquire` then takes a `PSS_CAPTURE_VA_CLONE` snapshot, falling back to a plain live read if that fails. `list_regions` walks the address space, `group_images` collects regions into images by allocation base, and `read_image` copies each image's committed regions into a buffer, zero-filling anything unreadable and recording what protections each region actually had. `find_hidden_images` looks for page-aligned PE headers inside executable non-image allocations, and `read_allocations` picks up readable non-image memory so the carver can search it later.
+
+**2. Rebuild** (`src/pe/rebuild.rs`, one image at a time)
+
+`resolve_source_bytes` decides which bytes to work from. It parses the captured headers; if `e_lfanew` is unusable, `parse_memory_image` brute-force scans for an NT signature before giving up. Only if that fails does mempe read the original file from disk and splice its headers on, and only when the memory at that base is still image-backed and the mapped file still matches the name the loader reported. Either way, `recover_section_headers` then repairs the section table from the region evidence gathered during capture. That last step does most of the work for packed images, whose section headers often claim a raw size of zero.
+
+`build_output_buffer` lays out the file, `write_core_header_fields` fixes the fields that describe the new layout, and `write_sections` copies each section from its memory offset to its file offset, renaming any section whose name is unreadable.
+
+`apply_repairs` then clears data directories that no longer point into the rebuilt file, drops x64 unwind entries that fail validation, repoints debug entries at the new layout, and clears the dynamic-base flag on images that have no relocations.
+
+`resolve_imports` builds an import plan. It prefers the existing descriptor table; failing that it looks for an intact descriptor array the packer left behind, then for trusted IAT ranges. It always additionally walks delay-load directory 13 and any `call`/`jmp`/`mov` instruction that references a data slot. Anything recovered is written into an appended `.mempe` section.
+
+`finalize_output` applies the entry point, recomputes derived header sizes and the checksum, and reparses the finished bytes with an independent PE parser as a self-check. If that reparse fails, the image is reported as a failure rather than written.
+
+**3. Carve** (`src/pe/carve.rs`)
+
+Every captured image and every readable non-image allocation is scanned for embedded PEs. A candidate has to survive a full disk-image parse before it is written, and its length comes from its own section table and certificate directory, so signed payloads come out byte-exact.
+
+**4. Write** (`src/output.rs`, `src/dump.rs`)
+
+`dump.rs` turns rebuilt images, carved payloads, and raw regions into output files and accumulates the summary counters. `output.rs` writes them and handles name collisions.
+
 ## Output
 
-Dumped files are written to a `mempe` folder in the current directory. The main image keeps the target's file name. DLLs use their module or embedded export name when one is available; unnamed images fall back to their base address.
+Dumped files are written to a `mempe` folder in the current directory. The main image keeps the target's file name. DLLs use their module or embedded export name when one is available; unnamed images fall back to their base address. A payload carved out of an image is named after that image, one carved out of loose memory after the address it was found at, and raw regions after their base address and size.
 
 If `mempe` already contains files, mempe asks whether to overwrite matching names, rename new files, or cancel. When standard input is redirected, name conflicts are renamed automatically.
 
 The console summary shows what was rebuilt and calls out anything that may affect the dump, including unreadable pages, repaired headers, skipped import pointers, invalid directories, and modules that could not be rebuilt.
+
+Two lines describe what mempe observed rather than what it changed. The entry line says whether the entry point falls inside surviving unwind data, which ordinary compiler output almost always has and hand-written stubs usually do not. The layout line counts sections that were seen writable and executable at the same time. Neither is a verdict; both are observations that happen to differ between normal binaries and transformed ones.
+
+mempe also warns when an executable section is high-entropy but shows no sign of having been written since the image was mapped. That combination usually means the section was still encrypted when the snapshot was taken, so the copy in the dump is not real code. The warning is about mempe's own output, not about the target.
 
 ## Building
 
@@ -95,9 +139,11 @@ mempe needs permission to open and read the target process. An elevated target m
 
 ## Limitations
 
-- Import recovery is based on the IAT and the exports available in the captured process. Packed files, custom loaders, API hashing, and unusual thunk layouts may leave imports unresolved.
-- Hidden images are found by looking for page-aligned PE headers inside executable non-image allocations. Headerless payloads and raw shellcode are not dumped.
+- Import recovery depends on the IAT and on the exports available in the captured process. Packed files, custom loaders, API hashing, and unusual thunk layouts may leave imports unresolved.
+- A delay-load slot that has never been called still points at its own stub, so it cannot be resolved. Delay imports are only recovered once the program has used them.
+- Hidden images are found by looking for page-aligned PE headers. Headerless payloads and raw shellcode are only written with `--raw-regions`, and then as plain bytes with no reconstructed header.
 - Unreadable memory is replaced with zeroes. The warning count tells you how much data was lost.
+- The entropy warning cannot see a section that was never faulted in at all. It only fires on sections that are resident and unwritten.
 - A structurally valid PE is useful for static analysis, but it may still need manual work before it can run.
 - Only x86 and x64 Windows PE images are supported.
 

@@ -1,11 +1,10 @@
 use crate::pe::image::read_u32;
 use crate::pe::parse::parse_disk_image;
-use crate::pe::{PeImage, PeKind};
+use crate::pe::{PeImage, PeKind, SECURITY_DIRECTORY};
 
 const DOS_MAGIC: [u8; 2] = [b'M', b'Z'];
 const RAW_SIZE_OFFSET: usize = 16;
 const RAW_POINTER_OFFSET: usize = 20;
-const SECURITY_DIRECTORY: usize = 4;
 const SUBSYSTEM_NATIVE: u16 = 1;
 const MIN_EMBEDDED_SIZE: usize = 0x100;
 const MAX_EMBEDDED_SIZE: usize = 256 * 1024 * 1024;

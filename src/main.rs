@@ -57,6 +57,7 @@ fn run(console: &Console, request: Request) -> ExitCode {
     let Request {
         command,
         entry_point,
+        raw_regions,
     } = request;
     let watched = matches!(&command, Command::Watch(_));
     let output = match output::prepare() {
@@ -79,7 +80,7 @@ fn run(console: &Console, request: Request) -> ExitCode {
         render_stability(console, &target);
     }
 
-    let capture = match memory::capture(&target) {
+    let capture = match memory::capture(&target, raw_regions) {
         Ok(capture) => capture,
         Err(error) => {
             console.error(format_args!("Capture failed: {error}"));
@@ -170,39 +171,7 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
         .iter()
         .find(|artifact| artifact.context.is_main)
     {
-        console.field("Main", format_args!("{}", main.path.display()));
-        console.field(
-            "Layout",
-            format_args!(
-                "{}, {} sections, base 0x{:016X}",
-                main.context.kind, main.context.sections, main.context.base
-            ),
-        );
-        console.field(
-            "Entry",
-            format_args!(
-                "0x{:08X} ({})",
-                main.context.entry_point,
-                main.context
-                    .entry_section
-                    .as_deref()
-                    .unwrap_or("outside every section")
-            ),
-        );
-        if main.context.private_pages > 0 {
-            console.field(
-                "Runtime",
-                format_args!(
-                    "{} of {} resident pages were written after load",
-                    main.context.private_pages, main.context.resident_pages
-                ),
-            );
-        } else {
-            console.field(
-                "Runtime",
-                format_args!("not measurable; re-run against a freshly started process"),
-            );
-        }
+        render_main_artifact(console, main);
     }
     console.field("DLLs", format_args!("{}", outcome.summary.dlls));
     console.field(
@@ -213,8 +182,62 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
         "Embedded",
         format_args!("{} carved PEs", outcome.summary.embedded_pes),
     );
+    if outcome.summary.raw_regions > 0 {
+        console.field(
+            "Regions",
+            format_args!("{} written", outcome.summary.raw_regions),
+        );
+    }
     console.field("Folder", format_args!("{}", output.directory().display()));
     console.blank();
+}
+
+fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::ArtifactInfo>) {
+    console.field("Main", format_args!("{}", main.path.display()));
+    console.field(
+        "Layout",
+        format_args!(
+            "{}, {} sections ({} write+execute), base 0x{:016X}",
+            main.context.kind,
+            main.context.sections,
+            main.context.write_execute_sections,
+            main.context.base
+        ),
+    );
+    console.field(
+        "Entry",
+        format_args!(
+            "0x{:08X} ({}{})",
+            main.context.entry_point,
+            main.context
+                .entry_section
+                .as_deref()
+                .unwrap_or("outside every section"),
+            unwind_note(main.context.entry_unwind_covered)
+        ),
+    );
+    if main.context.private_pages > 0 {
+        console.field(
+            "Runtime",
+            format_args!(
+                "{} of {} resident pages were written after load",
+                main.context.private_pages, main.context.resident_pages
+            ),
+        );
+        return;
+    }
+    console.field(
+        "Runtime",
+        format_args!("not measurable; re-run against a freshly started process"),
+    );
+}
+
+fn unwind_note(covered: Option<bool>) -> &'static str {
+    match covered {
+        Some(true) => ", unwind-covered",
+        Some(false) => ", no unwind entry",
+        None => "",
+    }
 }
 
 fn render_analysis(console: &Console, outcome: &DumpOutcome) {
@@ -261,80 +284,90 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
         .saturating_sub(outcome.hidden_non_image_images);
     if unmatched_non_image > 0 {
         console.warning(format_args!(
-            "{unmatched_non_image} executable non-image allocations did not contain a full PE"
+            "Executable non-image allocations holding no complete PE: {unmatched_non_image}"
         ));
     }
 }
 
 fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
     let summary = &outcome.summary;
-    if summary.unreadable_pages > 0 {
-        console.warning(format_args!(
-            "{} unreadable pages were zero-filled",
-            summary.unreadable_pages
-        ));
+    for (count, label) in repair_warning_counts(summary) {
+        if count > 0 {
+            console.warning(format_args!("{label}: {count}"));
+        }
     }
-    if summary.cleared_directories > 0 {
-        console.warning(format_args!(
-            "{} invalid or file-only directories were cleared",
-            summary.cleared_directories
-        ));
+    if summary.notable_cleared_directories.is_empty() {
+        return;
     }
-    if summary.repaired_headers > 0 {
-        console.warning(format_args!(
-            "{} damaged PE headers were repaired",
-            summary.repaired_headers
-        ));
-    }
-    if summary.disk_header_repairs > 0 {
-        console.warning(format_args!(
-            "{} images used disk headers; section data came from memory",
-            summary.disk_header_repairs
-        ));
-    }
-    if summary.renamed_sections > 0 {
-        console.warning(format_args!(
-            "{} unreadable section names were replaced",
-            summary.renamed_sections
-        ));
-    }
-    if summary.repaired_debug_entries > 0 {
-        console.warning(format_args!(
-            "{} debug entries were repointed at the rebuilt layout",
-            summary.repaired_debug_entries
-        ));
-    }
-    if summary.fixed_image_bases > 0 {
-        console.warning(format_args!(
-            "{} images lost ASLR because they have no relocations",
-            summary.fixed_image_bases
-        ));
-    }
-    if summary.unlinked_images > 0 {
-        console.warning(format_args!(
-            "{} mapped images are missing from the loader module list",
-            summary.unlinked_images
-        ));
-    }
+    let names = summary
+        .notable_cleared_directories
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    console.warning(format_args!("Notable directories cleared: {names}"));
+}
+
+fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 11] {
+    [
+        (summary.unreadable_pages, "Unreadable pages zero-filled"),
+        (
+            summary.cleared_directories,
+            "Invalid or file-only directories cleared",
+        ),
+        (
+            summary.executable_flags_added,
+            "Images given a missing IMAGE_FILE_EXECUTABLE_IMAGE flag",
+        ),
+        (summary.repaired_headers, "Damaged PE headers repaired"),
+        (
+            summary.disk_header_repairs,
+            "Images rebuilt with disk headers, section data from memory",
+        ),
+        (
+            summary.renamed_sections,
+            "Unreadable section names replaced",
+        ),
+        (
+            summary.repaired_debug_entries,
+            "Debug entries repointed at the rebuilt layout",
+        ),
+        (
+            summary.fixed_image_bases,
+            "Images that lost ASLR because they have no relocations",
+        ),
+        (
+            summary.unlinked_images,
+            "Mapped images missing from the loader module list",
+        ),
+        (
+            summary.never_decrypted_sections,
+            "High-entropy sections never written after loading, so mempe's copy may still be encrypted",
+        ),
+        (
+            summary.path_mismatches,
+            "Images mapped from a different file than the loader reports",
+        ),
+    ]
 }
 
 fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {
     let summary = &outcome.summary;
     if summary.ambiguous_imports > 0 {
         console.warning(format_args!(
-            "{} ambiguous import pointers were skipped",
+            "Ambiguous import pointers skipped: {}",
             summary.ambiguous_imports
         ));
     }
     if summary.invalid_unwind_entries > 0 {
         console.warning(format_args!(
-            "{} invalid x64 unwind entries were removed",
+            "Invalid x64 unwind entries removed: {}",
             summary.invalid_unwind_entries
         ));
     }
     if outcome.export_stats.unresolved_forwarders > 0 {
         console.warning(format_args!(
-            "{} forwarded exports did not match a loaded image",
+            "Forwarded exports with no matching image: {}",
             outcome.export_stats.unresolved_forwarders
         ));
     }

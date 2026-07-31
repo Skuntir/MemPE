@@ -69,21 +69,137 @@ pub(crate) fn memory_image_size(bytes: &[u8]) -> AppResult<usize> {
     parse_candidate(bytes, nt_offset, false, false).map(|model| model.image_size as usize)
 }
 
+struct FileHeader {
+    offset: usize,
+    machine: u16,
+    section_count: usize,
+    optional_size: usize,
+    characteristics: u16,
+}
+
+struct OptionalOffsets {
+    subsystem: usize,
+    size_of_code: usize,
+    size_of_initialized_data: usize,
+    size_of_uninitialized_data: usize,
+    entry_point: usize,
+    base_of_code: usize,
+    image_base: usize,
+    dll_characteristics: usize,
+}
+
+struct OptionalShape {
+    kind: PeKind,
+    minimum_size: usize,
+    image_base_relative: usize,
+    directory_count_relative: usize,
+    directory_relative: usize,
+}
+
 fn parse_candidate(
     bytes: &[u8],
     nt_offset: usize,
     salvaged: bool,
     require_full_image: bool,
 ) -> AppResult<PeModel> {
+    let header = parse_file_header(bytes, nt_offset)?;
+    let optional_offset = checked_add(header.offset, FILE_HEADER_SIZE, "optional header")?;
+    let optional_end = checked_add(optional_offset, header.optional_size, "optional header end")?;
+    require_range(bytes, optional_offset, header.optional_size)?;
+
+    let shape = optional_header_shape(read_u16(bytes, optional_offset)?, header.machine)?;
+    if header.optional_size < shape.minimum_size {
+        return Err(AppError::new("optional header is truncated"));
+    }
+
+    let size_of_image_offset = checked_add(optional_offset, 56, "image size")?;
+    let size_of_headers_offset = checked_add(optional_offset, 60, "header size")?;
+    let number_of_directories_offset = checked_add(
+        optional_offset,
+        shape.directory_count_relative,
+        "directory count",
+    )?;
+    let data_directory_offset = checked_add(
+        optional_offset,
+        shape.directory_relative,
+        "data directories",
+    )?;
+    let file_alignment = read_u32(bytes, checked_add(optional_offset, 36, "file alignment")?)?;
+    let section_alignment = read_u32(
+        bytes,
+        checked_add(optional_offset, 32, "section alignment")?,
+    )?;
+    validate_alignments(file_alignment, section_alignment)?;
+    let declared_image_size =
+        read_declared_image_size(bytes, size_of_image_offset, require_full_image)?;
+
+    let declared_directory_count = usize::try_from(read_u32(bytes, number_of_directories_offset)?)
+        .map_err(|_| AppError::new("data-directory count does not fit memory"))?;
+    let directory_count = declared_directory_count
+        .min(16)
+        .min(optional_end.saturating_sub(data_directory_offset) / 8);
+    let section_table_size = header
+        .section_count
+        .checked_mul(SECTION_HEADER_SIZE)
+        .ok_or_else(|| AppError::new("section table size overflowed"))?;
+    require_range(bytes, optional_end, section_table_size)?;
+    let sections = parse_sections(
+        bytes,
+        optional_end,
+        header.section_count,
+        declared_image_size,
+    )?;
+
+    let offsets = optional_offsets(optional_offset, shape.image_base_relative)?;
+    Ok(PeModel {
+        kind: shape.kind,
+        is_dll: header.characteristics & IMAGE_FILE_DLL != 0,
+        subsystem: read_u16(bytes, offsets.subsystem)?,
+        nt_offset,
+        size_of_code_offset: offsets.size_of_code,
+        size_of_initialized_data_offset: offsets.size_of_initialized_data,
+        size_of_uninitialized_data_offset: offsets.size_of_uninitialized_data,
+        entry_point_offset: offsets.entry_point,
+        base_of_code_offset: offsets.base_of_code,
+        image_base_offset: offsets.image_base,
+        size_of_image_offset,
+        size_of_headers_offset,
+        dll_characteristics_offset: offsets.dll_characteristics,
+        number_of_directories_offset,
+        data_directory_offset,
+        directory_count,
+        file_alignment,
+        section_alignment,
+        image_size: u32::try_from(declared_image_size)
+            .map_err(|_| AppError::new("declared image size does not fit a PE field"))?,
+        sections,
+        salvaged,
+    })
+}
+
+fn optional_offsets(
+    optional_offset: usize,
+    image_base_relative: usize,
+) -> AppResult<OptionalOffsets> {
+    Ok(OptionalOffsets {
+        subsystem: checked_add(optional_offset, 68, "subsystem")?,
+        size_of_code: checked_add(optional_offset, 4, "code size")?,
+        size_of_initialized_data: checked_add(optional_offset, 8, "initialized-data size")?,
+        size_of_uninitialized_data: checked_add(optional_offset, 12, "uninitialized-data size")?,
+        entry_point: checked_add(optional_offset, 16, "entry point")?,
+        base_of_code: checked_add(optional_offset, 20, "base of code")?,
+        image_base: checked_add(optional_offset, image_base_relative, "image base")?,
+        dll_characteristics: checked_add(optional_offset, 70, "DLL characteristics")?,
+    })
+}
+
+fn parse_file_header(bytes: &[u8], nt_offset: usize) -> AppResult<FileHeader> {
     if read_u32(bytes, nt_offset)? != NT_SIGNATURE {
         return Err(AppError::new("NT signature is missing"));
     }
-    let file_header = checked_add(nt_offset, 4, "file header offset")?;
-    let machine = read_u16(bytes, file_header)?;
-    let section_count = usize::from(read_u16(
-        bytes,
-        checked_add(file_header, 2, "section count")?,
-    )?);
+    let offset = checked_add(nt_offset, 4, "file header offset")?;
+    let machine = read_u16(bytes, offset)?;
+    let section_count = usize::from(read_u16(bytes, checked_add(offset, 2, "section count")?)?);
     if section_count == 0 || section_count > MAX_SECTIONS {
         return Err(AppError::new(format!(
             "invalid section count {section_count}"
@@ -91,14 +207,19 @@ fn parse_candidate(
     }
     let optional_size = usize::from(read_u16(
         bytes,
-        checked_add(file_header, 16, "optional-header size")?,
+        checked_add(offset, 16, "optional-header size")?,
     )?);
-    let characteristics = read_u16(bytes, checked_add(file_header, 18, "file characteristics")?)?;
-    let optional_offset = checked_add(file_header, FILE_HEADER_SIZE, "optional header")?;
-    let optional_end = checked_add(optional_offset, optional_size, "optional header end")?;
-    require_range(bytes, optional_offset, optional_size)?;
+    let characteristics = read_u16(bytes, checked_add(offset, 18, "file characteristics")?)?;
+    Ok(FileHeader {
+        offset,
+        machine,
+        section_count,
+        optional_size,
+        characteristics,
+    })
+}
 
-    let magic = read_u16(bytes, optional_offset)?;
+fn optional_header_shape(magic: u16, machine: u16) -> AppResult<OptionalShape> {
     let (kind, minimum_size, image_base_relative, directory_count_relative, directory_relative) =
         match magic {
             PE32_MAGIC if machine == MACHINE_I386 => (PeKind::Pe32, 96, 28, 92, 96),
@@ -115,50 +236,45 @@ fn parse_candidate(
             }
             _ => return Err(AppError::new(format!("unknown PE magic 0x{magic:04X}"))),
         };
-    if optional_size < minimum_size {
-        return Err(AppError::new("optional header is truncated"));
-    }
+    Ok(OptionalShape {
+        kind,
+        minimum_size,
+        image_base_relative,
+        directory_count_relative,
+        directory_relative,
+    })
+}
 
-    let section_alignment_offset = checked_add(optional_offset, 32, "section alignment")?;
-    let file_alignment_offset = checked_add(optional_offset, 36, "file alignment")?;
-    let size_of_image_offset = checked_add(optional_offset, 56, "image size")?;
-    let size_of_headers_offset = checked_add(optional_offset, 60, "header size")?;
-    let number_of_directories_offset =
-        checked_add(optional_offset, directory_count_relative, "directory count")?;
-    let data_directory_offset =
-        checked_add(optional_offset, directory_relative, "data directories")?;
-    let file_alignment = read_u32(bytes, file_alignment_offset)?;
-    let section_alignment = read_u32(bytes, section_alignment_offset)?;
-    validate_alignments(file_alignment, section_alignment)?;
-    let declared_image_size = usize::try_from(read_u32(bytes, size_of_image_offset)?)
+fn read_declared_image_size(
+    bytes: &[u8],
+    size_of_image_offset: usize,
+    require_full_image: bool,
+) -> AppResult<usize> {
+    let declared = usize::try_from(read_u32(bytes, size_of_image_offset)?)
         .map_err(|_| AppError::new("declared image size does not fit memory"))?;
-    if declared_image_size == 0 || declared_image_size > MAX_IMAGE_SIZE {
+    if declared == 0 || declared > MAX_IMAGE_SIZE {
         return Err(AppError::new(format!(
-            "declared image size {declared_image_size} is outside the safety limit"
+            "declared image size {declared} is outside the safety limit"
         )));
     }
-    if require_full_image && declared_image_size > bytes.len() {
+    if require_full_image && declared > bytes.len() {
         return Err(AppError::new(format!(
-            "declared image size {declared_image_size} does not fit the captured memory"
+            "declared image size {declared} does not fit the captured memory"
         )));
     }
+    Ok(declared)
+}
 
-    let declared_directory_count = usize::try_from(read_u32(bytes, number_of_directories_offset)?)
-        .map_err(|_| AppError::new("data-directory count does not fit memory"))?;
-    let available_directory_bytes = optional_end.saturating_sub(data_directory_offset);
-    let directory_count = declared_directory_count
-        .min(16)
-        .min(available_directory_bytes / 8);
-    let section_table_offset = optional_end;
-    let section_table_size = section_count
-        .checked_mul(SECTION_HEADER_SIZE)
-        .ok_or_else(|| AppError::new("section table size overflowed"))?;
-    require_range(bytes, section_table_offset, section_table_size)?;
-
+fn parse_sections(
+    bytes: &[u8],
+    table_offset: usize,
+    section_count: usize,
+    declared_image_size: usize,
+) -> AppResult<Vec<SectionModel>> {
     let mut sections = Vec::with_capacity(section_count);
     for index in 0..section_count {
         let header_offset = checked_add(
-            section_table_offset,
+            table_offset,
             index
                 .checked_mul(SECTION_HEADER_SIZE)
                 .ok_or_else(|| AppError::new("section header offset overflowed"))?,
@@ -188,35 +304,7 @@ fn parse_candidate(
         });
     }
     validate_non_overlapping_sections(&sections)?;
-
-    Ok(PeModel {
-        kind,
-        is_dll: characteristics & IMAGE_FILE_DLL != 0,
-        subsystem: read_u16(bytes, checked_add(optional_offset, 68, "subsystem")?)?,
-        nt_offset,
-        size_of_code_offset: checked_add(optional_offset, 4, "code size")?,
-        size_of_initialized_data_offset: checked_add(optional_offset, 8, "initialized-data size")?,
-        size_of_uninitialized_data_offset: checked_add(
-            optional_offset,
-            12,
-            "uninitialized-data size",
-        )?,
-        entry_point_offset: checked_add(optional_offset, 16, "entry point")?,
-        base_of_code_offset: checked_add(optional_offset, 20, "base of code")?,
-        image_base_offset: checked_add(optional_offset, image_base_relative, "image base")?,
-        size_of_image_offset,
-        size_of_headers_offset,
-        dll_characteristics_offset: checked_add(optional_offset, 70, "DLL characteristics")?,
-        number_of_directories_offset,
-        data_directory_offset,
-        directory_count,
-        file_alignment,
-        section_alignment,
-        image_size: u32::try_from(declared_image_size)
-            .map_err(|_| AppError::new("declared image size does not fit a PE field"))?,
-        sections,
-        salvaged,
-    })
+    Ok(sections)
 }
 
 fn validate_alignments(file_alignment: u32, section_alignment: u32) -> AppResult<()> {

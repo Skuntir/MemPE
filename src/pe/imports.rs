@@ -2,19 +2,39 @@ use std::collections::BTreeSet;
 
 use crate::pe::exports::{ExportIndex, ResolvedExport};
 use crate::pe::image;
-use crate::pe::{PeImage, PeKind, Rva};
+use crate::pe::{
+    IAT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+    IMPORT_DIRECTORY, PeImage, PeKind, Rva,
+};
 
-const IMPORT_DIRECTORY: usize = 1;
-const IAT_DIRECTORY: usize = 12;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
-const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
-const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 const MAX_IMPORTS: usize = 65_536;
 const MAX_IMPORT_GROUPS: usize = 4_096;
 const MAX_IMPORT_NAME: usize = 4_096;
 const MAX_THUNK_DEPTH: usize = 4;
 const MAX_CODE_REFERENCE_BYTES: usize = 256 * 1024 * 1024;
+const DELAY_IMPORT_DIRECTORY: usize = 13;
+const DELAY_DESCRIPTOR_SIZE: usize = 32;
+const DELAY_ATTRIBUTES_RVA_BASED: u32 = 0x1;
+const DELAY_NAME_OFFSET: usize = 4;
+const DELAY_IAT_OFFSET: usize = 12;
+const DELAY_INT_OFFSET: usize = 16;
+const DESCRIPTOR_ORIGINAL_THUNK_OFFSET: usize = 0;
+const DESCRIPTOR_NAME_OFFSET: usize = 12;
+const DESCRIPTOR_FIRST_THUNK_OFFSET: usize = 16;
+const DESCRIPTOR_SCAN_STEP: usize = 4;
+const MAX_DESCRIPTOR_SCAN_STEPS: usize = 1_000_000;
+const MIN_AVERAGE_THUNKS: usize = 2;
+const CALL_JUMP_LENGTH: usize = 6;
+const CALL_JUMP_PREFIX: u8 = 0xFF;
+const CALL_MODRM: u8 = 0x15;
+const JUMP_MODRM: u8 = 0x25;
+const MOV_LOAD_LENGTH: usize = 7;
+const MOV_REX_W: u8 = 0x48;
+const MOV_REX_WR: u8 = 0x4C;
+const MOV_LOAD_OPCODE: u8 = 0x8B;
+const MODRM_RIP_MASK: u8 = 0xC7;
+const MODRM_RIP_VALUE: u8 = 0x05;
 
 pub(super) struct ImportEntry {
     pub(super) name: Option<String>,
@@ -41,10 +61,11 @@ pub(super) fn build_plan(
     exports: &ExportIndex,
 ) -> ImportPlan {
     let mut plan = ImportPlan::default();
-    match existing_descriptors(image) {
+    match existing_descriptors(image).or_else(|| scan_for_orphaned_descriptors(image)) {
         Some(existing) => plan.existing = existing,
         None => scan_trusted_ranges(image, observed_base, exports, &mut plan),
     }
+    scan_delay_imports(image, observed_base, exports, &mut plan);
     recover_referenced_imports(image, observed_base, exports, &mut plan);
     plan
 }
@@ -97,6 +118,93 @@ fn scan_trusted_ranges(
     }
 }
 
+fn scan_delay_imports(
+    image: &PeImage<'_>,
+    observed_base: usize,
+    exports: &ExportIndex,
+    plan: &mut ImportPlan,
+) {
+    let Some((directory_rva, directory_size)) = directory(image, DELAY_IMPORT_DIRECTORY) else {
+        return;
+    };
+    if (directory_size as usize) < DELAY_DESCRIPTOR_SIZE {
+        return;
+    }
+    let memory = image.bytes();
+    let kind = image.model().kind();
+    let width = kind.pointer_width();
+    let already_recovered = collect_recovered_slots(plan, width);
+    let max_descriptors = (directory_size as usize / DELAY_DESCRIPTOR_SIZE).min(MAX_IMPORT_GROUPS);
+    let mut budget = MAX_IMPORTS;
+    for index in 0..max_descriptors {
+        if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
+            break;
+        }
+        let Some(offset) =
+            (directory_rva as usize).checked_add(index.saturating_mul(DELAY_DESCRIPTOR_SIZE))
+        else {
+            break;
+        };
+        let Some(descriptor) = memory.get(offset..offset.saturating_add(DELAY_DESCRIPTOR_SIZE))
+        else {
+            break;
+        };
+        if descriptor.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let Some((start, end)) = delay_table_range(memory, descriptor, width, &mut budget) else {
+            continue;
+        };
+        if u32::try_from(start).is_ok_and(|slot| already_recovered.contains(&slot)) {
+            continue;
+        }
+        scan_import_range(memory, observed_base, kind, exports, start, end, plan);
+    }
+}
+
+fn delay_table_range(
+    memory: &[u8],
+    descriptor: &[u8],
+    width: usize,
+    budget: &mut usize,
+) -> Option<(usize, usize)> {
+    if read_u32(descriptor, 0)? & DELAY_ATTRIBUTES_RVA_BASED == 0 {
+        return None;
+    }
+    read_ascii(memory, read_u32(descriptor, DELAY_NAME_OFFSET)? as usize)?;
+    let iat_rva = read_u32(descriptor, DELAY_IAT_OFFSET)? as usize;
+    let int_rva = read_u32(descriptor, DELAY_INT_OFFSET)? as usize;
+    if iat_rva == 0
+        || int_rva == 0
+        || !iat_rva.is_multiple_of(width)
+        || !int_rva.is_multiple_of(width)
+    {
+        return None;
+    }
+    let entries = delay_table_length(memory, iat_rva, width, budget)?;
+    if entries == 0 || entries != delay_table_length(memory, int_rva, width, budget)? {
+        return None;
+    }
+    let end = iat_rva.checked_add(entries.checked_mul(width)?)?;
+    Some((iat_rva, end))
+}
+
+fn delay_table_length(
+    memory: &[u8],
+    start: usize,
+    width: usize,
+    budget: &mut usize,
+) -> Option<usize> {
+    for index in 0..*budget {
+        *budget = budget.saturating_sub(1);
+        let offset = start.checked_add(index.checked_mul(width)?)?;
+        if read_pointer(memory, offset, width)? == 0 {
+            return Some(index);
+        }
+    }
+    None
+}
+
 fn scan_import_range(
     memory: &[u8],
     observed_base: usize,
@@ -106,7 +214,7 @@ fn scan_import_range(
     end: usize,
     plan: &mut ImportPlan,
 ) {
-    let width = if kind == PeKind::Pe32 { 4 } else { 8 };
+    let width = kind.pointer_width();
     let aligned_start = start.saturating_add((width - start % width) % width);
     let mut offset = aligned_start;
     while offset.saturating_add(width) <= end && plan.recovered < MAX_IMPORTS {
@@ -158,7 +266,7 @@ fn recover_referenced_imports(
     let model = image.model();
     let memory = image.bytes();
     let kind = model.kind();
-    let width = if kind == PeKind::Pe32 { 4 } else { 8 };
+    let width = kind.pointer_width();
     let mut recovered = collect_recovered_slots(plan, width);
     recovered.append(&mut existing_thunk_slots(memory, &plan.existing, width));
     let referenced = find_referenced_slots(image, observed_base);
@@ -229,27 +337,49 @@ fn decode_slot_reference(
     kind: PeKind,
     instruction: usize,
 ) -> Option<u32> {
-    let code = memory.get(instruction..instruction.checked_add(6)?)?;
-    if code[0] != 0xFF || !matches!(code[1], 0x15 | 0x25) {
+    if let Some(code) = memory.get(instruction..instruction.checked_add(CALL_JUMP_LENGTH)?)
+        && code[0] == CALL_JUMP_PREFIX
+        && matches!(code[1], CALL_MODRM | JUMP_MODRM)
+    {
+        let operand = u32::from_le_bytes([code[2], code[3], code[4], code[5]]);
+        return match kind {
+            PeKind::Pe32 => {
+                u32::try_from(usize::try_from(operand).ok()?.checked_sub(observed_base)?).ok()
+            }
+            PeKind::Pe32Plus => {
+                rip_relative_slot(observed_base, instruction, CALL_JUMP_LENGTH, operand as i32)
+            }
+        };
+    }
+    if kind != PeKind::Pe32Plus {
         return None;
     }
-    let operand = u32::from_le_bytes([code[2], code[3], code[4], code[5]]);
-    let slot = match kind {
-        PeKind::Pe32 => usize::try_from(operand).ok()?.checked_sub(observed_base)?,
-        PeKind::Pe32Plus => {
-            let next = observed_base
-                .checked_add(instruction)?
-                .checked_add(code.len())?;
-            let displacement = operand as i32;
-            let address = if displacement >= 0 {
-                next.checked_add(displacement as usize)?
-            } else {
-                next.checked_sub(displacement.unsigned_abs() as usize)?
-            };
-            address.checked_sub(observed_base)?
-        }
+    let code = memory.get(instruction..instruction.checked_add(MOV_LOAD_LENGTH)?)?;
+    if !matches!(code[0], MOV_REX_W | MOV_REX_WR)
+        || code[1] != MOV_LOAD_OPCODE
+        || code[2] & MODRM_RIP_MASK != MODRM_RIP_VALUE
+    {
+        return None;
+    }
+    let displacement = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);
+    rip_relative_slot(observed_base, instruction, MOV_LOAD_LENGTH, displacement)
+}
+
+fn rip_relative_slot(
+    observed_base: usize,
+    instruction: usize,
+    length: usize,
+    displacement: i32,
+) -> Option<u32> {
+    let next = observed_base
+        .checked_add(instruction)?
+        .checked_add(length)?;
+    let address = if displacement >= 0 {
+        next.checked_add(displacement as usize)?
+    } else {
+        next.checked_sub(displacement.unsigned_abs() as usize)?
     };
-    u32::try_from(slot).ok()
+    u32::try_from(address.checked_sub(observed_base)?).ok()
 }
 
 fn slot_is_in_data_section(image: &PeImage<'_>, slot: u32, width: usize) -> bool {
@@ -480,34 +610,86 @@ fn thunk_table_is_valid(
     first: u32,
     budget: &mut usize,
 ) -> bool {
+    thunk_table_length(memory, kind, original, first, budget).is_some()
+}
+
+fn thunk_table_length(
+    memory: &[u8],
+    kind: PeKind,
+    original: u32,
+    first: u32,
+    budget: &mut usize,
+) -> Option<usize> {
     let table = if original != 0 { original } else { first } as usize;
-    let width = if kind == PeKind::Pe32 { 4 } else { 8 };
+    let width = kind.pointer_width();
     let ordinal_flag = if kind == PeKind::Pe32 {
         0x8000_0000usize
     } else {
         0x8000_0000_0000_0000usize
     };
     for index in 0..*budget {
-        let Some(offset) = table.checked_add(index.saturating_mul(width)) else {
-            return false;
-        };
-        let Some(value) = read_pointer(memory, offset, width) else {
-            return false;
-        };
+        let offset = table.checked_add(index.saturating_mul(width))?;
+        let value = read_pointer(memory, offset, width)?;
         *budget = budget.saturating_sub(1);
         if value == 0 {
-            return index > 0;
+            return (index > 0).then_some(index);
         }
         if value & ordinal_flag == 0 {
-            let Some(name_offset) = value.checked_add(2) else {
-                return false;
-            };
-            if read_ascii(memory, name_offset).is_none() {
-                return false;
-            }
+            read_ascii(memory, value.checked_add(2)?)?;
         }
     }
-    false
+    None
+}
+
+fn scan_for_orphaned_descriptors(image: &PeImage<'_>) -> Option<Vec<u8>> {
+    let memory = image.bytes();
+    let model = image.model();
+    let mut steps = MAX_DESCRIPTOR_SCAN_STEPS;
+    for section in model.sections() {
+        if section.characteristics() & IMAGE_SCN_MEM_EXECUTE != 0
+            || section.characteristics() & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE) == 0
+        {
+            continue;
+        }
+        let start = section.virtual_address().as_usize();
+        let end = start
+            .saturating_add(section.span() as usize)
+            .min(memory.len());
+        let mut offset = start;
+        while offset.saturating_add(IMPORT_DESCRIPTOR_SIZE) <= end && steps > 0 {
+            steps = steps.saturating_sub(1);
+            if let Some(found) = try_descriptor_array(memory, model.kind(), offset) {
+                return Some(found);
+            }
+            offset = offset.saturating_add(DESCRIPTOR_SCAN_STEP);
+        }
+    }
+    None
+}
+
+fn try_descriptor_array(memory: &[u8], kind: PeKind, start: usize) -> Option<Vec<u8>> {
+    let mut descriptors = Vec::new();
+    let mut thunks = 0usize;
+    let mut budget = MAX_IMPORTS;
+    for index in 0..MAX_IMPORT_GROUPS {
+        let offset = start.checked_add(index.saturating_mul(IMPORT_DESCRIPTOR_SIZE))?;
+        let descriptor = memory.get(offset..offset.saturating_add(IMPORT_DESCRIPTOR_SIZE))?;
+        if descriptor.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let original_thunk = read_u32(descriptor, DESCRIPTOR_ORIGINAL_THUNK_OFFSET)?;
+        let name_rva = read_u32(descriptor, DESCRIPTOR_NAME_OFFSET)? as usize;
+        let first_thunk = read_u32(descriptor, DESCRIPTOR_FIRST_THUNK_OFFSET)?;
+        if name_rva == 0 || first_thunk == 0 || name_rva >= memory.len() {
+            return None;
+        }
+        read_ascii(memory, name_rva)?;
+        let length = thunk_table_length(memory, kind, original_thunk, first_thunk, &mut budget)?;
+        thunks = thunks.saturating_add(length);
+        descriptors.extend_from_slice(descriptor);
+    }
+    let count = descriptors.len() / IMPORT_DESCRIPTOR_SIZE;
+    (count > 0 && thunks >= count.saturating_mul(MIN_AVERAGE_THUNKS)).then_some(descriptors)
 }
 
 fn directory(image: &PeImage<'_>, index: usize) -> Option<(u32, u32)> {
@@ -537,7 +719,10 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use pelite::PeFile;
 
-    use super::{IMPORT_DESCRIPTOR_SIZE, build_plan, decode_slot_reference};
+    use super::{
+        IMPORT_DESCRIPTOR_SIZE, build_plan, decode_slot_reference, delay_table_range,
+        rip_relative_slot, try_descriptor_array,
+    };
     use crate::pe::parse::parse_memory_image;
     use crate::pe::{ExportIndex, PeKind, rebuild};
 
@@ -557,7 +742,7 @@ mod tests {
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].module, "fixture.dll");
 
-        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None)?;
+        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None, &[])?;
         assert_eq!(rebuilt.imports_rebuilt, 2);
         assert_eq!(rebuilt.section_count, 3);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
@@ -590,7 +775,7 @@ mod tests {
         assert_eq!(plan.groups[0].first_thunk, 0x2000);
         assert_eq!(plan.groups[0].entries.len(), 1);
 
-        let rebuilt = rebuild(&target, &[], target_base, None, &index, None)?;
+        let rebuilt = rebuild(&target, &[], target_base, None, &index, None, &[])?;
         assert_eq!(rebuilt.imports_rebuilt, 1);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
         Ok(())
@@ -644,7 +829,7 @@ mod tests {
         assert_eq!(plan.recovered, 1);
         assert_eq!(plan.groups[0].first_thunk, 0x2500);
 
-        let rebuilt = rebuild(&target, &[], target_base, None, &index, None)?;
+        let rebuilt = rebuild(&target, &[], target_base, None, &index, None, &[])?;
         let modules = PeFile::from_bytes(&rebuilt.bytes)?
             .imports()?
             .into_iter()
@@ -734,5 +919,136 @@ mod tests {
 
     fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn resolves_rip_relative_targets_in_both_directions() {
+        let base = 0x0000_0001_4000_0000usize;
+        assert_eq!(rip_relative_slot(base, 0x1000, 6, 0x100), Some(0x1106));
+        assert_eq!(rip_relative_slot(base, 0x1000, 6, -0x100), Some(0x0F06));
+        assert_eq!(rip_relative_slot(base, 0x1000, 7, 0), Some(0x1007));
+        assert_eq!(rip_relative_slot(0, 0, 6, -100), None);
+        assert_eq!(rip_relative_slot(base, 0x1000, 6, -0x4000_0000), None);
+    }
+
+    #[test]
+    fn decodes_call_jump_and_register_load_forms() {
+        let call = [0xFFu8, 0x15, 0x00, 0x01, 0x00, 0x00, 0x90];
+        let jump = [0xFFu8, 0x25, 0x00, 0x01, 0x00, 0x00, 0x90];
+        let mov_rax = [0x48u8, 0x8B, 0x05, 0x00, 0x01, 0x00, 0x00];
+        let mov_r9 = [0x4Cu8, 0x8B, 0x0D, 0x00, 0x01, 0x00, 0x00];
+
+        assert_eq!(
+            decode_slot_reference(&call, 0, PeKind::Pe32Plus, 0),
+            Some(0x106)
+        );
+        assert_eq!(
+            decode_slot_reference(&jump, 0, PeKind::Pe32Plus, 0),
+            Some(0x106)
+        );
+        assert_eq!(
+            decode_slot_reference(&mov_rax, 0, PeKind::Pe32Plus, 0),
+            Some(0x107)
+        );
+        assert_eq!(
+            decode_slot_reference(&mov_r9, 0, PeKind::Pe32Plus, 0),
+            Some(0x107)
+        );
+    }
+
+    #[test]
+    fn rejects_register_loads_that_are_not_rip_relative() {
+        let mov_rbp = [0x48u8, 0x8B, 0x45, 0x00, 0x01, 0x00, 0x00];
+        let add = [0x48u8, 0x03, 0x05, 0x00, 0x01, 0x00, 0x00];
+        let mov_rax = [0x48u8, 0x8B, 0x05, 0x00, 0x01, 0x00, 0x00];
+
+        assert_eq!(
+            decode_slot_reference(&mov_rbp, 0, PeKind::Pe32Plus, 0),
+            None
+        );
+        assert_eq!(decode_slot_reference(&add, 0, PeKind::Pe32Plus, 0), None);
+        assert_eq!(decode_slot_reference(&mov_rax, 0, PeKind::Pe32, 0), None);
+    }
+
+    fn delay_fixture() -> Vec<u8> {
+        let mut memory = vec![0u8; 0x200];
+        memory[0x30..0x34].copy_from_slice(b"a.d ");
+        put_u64(&mut memory, 0x40, 0x1111);
+        put_u64(&mut memory, 0x48, 0x2222);
+        put_u64(&mut memory, 0x60, 0x3333);
+        put_u64(&mut memory, 0x68, 0x4444);
+        memory
+    }
+
+    fn delay_descriptor(attributes: u32, iat: u32, int: u32) -> Vec<u8> {
+        let mut descriptor = vec![0u8; 32];
+        descriptor[0..4].copy_from_slice(&attributes.to_le_bytes());
+        descriptor[4..8].copy_from_slice(&0x30u32.to_le_bytes());
+        descriptor[12..16].copy_from_slice(&iat.to_le_bytes());
+        descriptor[16..20].copy_from_slice(&int.to_le_bytes());
+        descriptor
+    }
+
+    #[test]
+    fn accepts_a_delay_descriptor_whose_tables_agree() {
+        let memory = delay_fixture();
+        let descriptor = delay_descriptor(1, 0x40, 0x60);
+        let mut budget = 1_000usize;
+
+        assert_eq!(
+            delay_table_range(&memory, &descriptor, 8, &mut budget),
+            Some((0x40, 0x50))
+        );
+    }
+
+    #[test]
+    fn rejects_delay_descriptors_that_fail_any_gate() {
+        let mut memory = delay_fixture();
+        let mut budget = 1_000usize;
+
+        let not_rva_based = delay_descriptor(0, 0x40, 0x60);
+        assert_eq!(
+            delay_table_range(&memory, &not_rva_based, 8, &mut budget),
+            None
+        );
+
+        let misaligned = delay_descriptor(1, 0x41, 0x60);
+        assert_eq!(
+            delay_table_range(&memory, &misaligned, 8, &mut budget),
+            None
+        );
+
+        put_u64(&mut memory, 0x70, 0x5555);
+        let uneven = delay_descriptor(1, 0x40, 0x60);
+        assert_eq!(delay_table_range(&memory, &uneven, 8, &mut budget), None);
+    }
+
+    fn descriptor_array_fixture(thunks: usize) -> Vec<u8> {
+        let mut memory = vec![0u8; 0x400];
+        memory[0x100..0x104].copy_from_slice(b"a.d ");
+        let descriptor = 0x200usize;
+        memory[descriptor..descriptor + 4].copy_from_slice(&0x120u32.to_le_bytes());
+        memory[descriptor + 12..descriptor + 16].copy_from_slice(&0x100u32.to_le_bytes());
+        memory[descriptor + 16..descriptor + 20].copy_from_slice(&0x180u32.to_le_bytes());
+        for index in 0..thunks {
+            put_u64(&mut memory, 0x120 + index * 8, 0x8000_0000_0000_0001);
+        }
+        memory
+    }
+
+    #[test]
+    fn accepts_a_descriptor_array_with_enough_thunks() {
+        let memory = descriptor_array_fixture(2);
+
+        let found = try_descriptor_array(&memory, PeKind::Pe32Plus, 0x200);
+
+        assert_eq!(found.map(|bytes| bytes.len()), Some(IMPORT_DESCRIPTOR_SIZE));
+    }
+
+    #[test]
+    fn rejects_a_descriptor_array_shaped_like_a_decoy() {
+        let memory = descriptor_array_fixture(1);
+
+        assert_eq!(try_descriptor_array(&memory, PeKind::Pe32Plus, 0x200), None);
     }
 }

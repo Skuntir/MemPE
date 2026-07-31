@@ -4,17 +4,22 @@ use std::num::NonZeroU32;
 use crate::pe::EntryPointRva;
 use crate::{AppError, AppResult};
 
+const MAX_TRAILING_OPTIONS: usize = 4;
+
 pub const HELP: &str = "mempe - Windows PE memory dumper and rebuilder\n\n\
 Usage:\n\
-  mempe.exe -p <PID> [-e|--entry-point <RVA>]\n\
-  mempe.exe -w <program.exe> [-e|--entry-point <RVA>]\n\
+  mempe.exe -p <PID> [-e|--entry-point <RVA>] [--raw-regions]\n\
+  mempe.exe -w <program.exe> [-e|--entry-point <RVA>] [--raw-regions]\n\
   mempe.exe -h\n\n\
--w waits up to 24 hours for a new matching process. Press Ctrl+C to stop.\n";
+-w waits up to 24 hours for a new matching process. Press Ctrl+C to stop.\n\
+--raw-regions also writes the untouched bytes of executable non-image\n\
+allocations that held no full PE. Off by default; it can add many files.\n";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Request {
     pub command: Command,
     pub entry_point: Option<EntryPointRva>,
+    pub raw_regions: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -54,10 +59,11 @@ where
     } else {
         parse_watch_name(value).map(Command::Watch)?
     };
-    let entry_point = parse_entry_point_option(&mut args)?;
+    let options = parse_trailing_options(&mut args)?;
     Ok(Some(Request {
         command,
-        entry_point,
+        entry_point: options.entry_point,
+        raw_regions: options.raw_regions,
     }))
 }
 
@@ -83,31 +89,49 @@ fn parse_watch_name(value: OsString) -> AppResult<String> {
     Ok(name)
 }
 
-fn parse_entry_point_option(
-    args: &mut impl Iterator<Item = OsString>,
-) -> AppResult<Option<EntryPointRva>> {
-    let Some(option) = args.next() else {
-        return Ok(None);
-    };
-    if option != "-e" && option != "--entry-point" {
-        return Err(AppError::new(format!(
-            "unknown option: {}",
-            option.to_string_lossy()
-        )));
+#[derive(Default)]
+struct TrailingOptions {
+    entry_point: Option<EntryPointRva>,
+    raw_regions: bool,
+}
+
+fn parse_trailing_options(args: &mut impl Iterator<Item = OsString>) -> AppResult<TrailingOptions> {
+    let mut options = TrailingOptions::default();
+    for _slot in 0..MAX_TRAILING_OPTIONS {
+        let Some(option) = args.next() else {
+            return Ok(options);
+        };
+        if option == "--raw-regions" {
+            if options.raw_regions {
+                return Err(AppError::new("--raw-regions was given twice"));
+            }
+            options.raw_regions = true;
+            continue;
+        }
+        if option != "-e" && option != "--entry-point" {
+            return Err(AppError::new(format!(
+                "unknown option: {}",
+                option.to_string_lossy()
+            )));
+        }
+        if options.entry_point.is_some() {
+            return Err(AppError::new("--entry-point was given twice"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| AppError::new("--entry-point needs an RVA"))?;
+        options.entry_point = Some(parse_entry_point(value)?);
     }
-    let value = args
-        .next()
-        .ok_or_else(|| AppError::new("--entry-point needs an RVA"))?;
-    if args.next().is_some() {
-        return Err(AppError::new("too many arguments"));
-    }
+    Err(AppError::new("too many arguments"))
+}
+
+fn parse_entry_point(value: OsString) -> AppResult<EntryPointRva> {
     let text = value
         .into_string()
         .map_err(|_| AppError::new("entry-point RVA must use valid text"))?;
     let parsed = parse_u32(&text)
         .map_err(|_| AppError::new(format!("invalid entry-point RVA: {text:?}")))?;
     EntryPointRva::new(parsed)
-        .map(Some)
         .ok_or_else(|| AppError::new("entry-point RVA must be greater than zero"))
 }
 

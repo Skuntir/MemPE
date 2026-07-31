@@ -34,10 +34,26 @@ impl EntryPointRva {
     }
 }
 
+pub(crate) const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+pub(crate) const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+pub(crate) const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub(crate) const IMPORT_DIRECTORY: usize = 1;
+pub(crate) const IAT_DIRECTORY: usize = 12;
+pub(crate) const SECURITY_DIRECTORY: usize = 4;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeKind {
     Pe32,
     Pe32Plus,
+}
+
+impl PeKind {
+    pub(crate) fn pointer_width(self) -> usize {
+        match self {
+            Self::Pe32 => 4,
+            Self::Pe32Plus => 8,
+        }
+    }
 }
 
 impl Display for PeKind {
@@ -100,4 +116,15 @@ struct PeModel {
     image_size: u32,
     sections: Vec<SectionModel>,
     salvaged: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeKind;
+
+    #[test]
+    fn pointer_width_follows_the_image_kind() {
+        assert_eq!(PeKind::Pe32.pointer_width(), 4);
+        assert_eq!(PeKind::Pe32Plus.pointer_width(), 8);
+    }
 }

@@ -124,57 +124,44 @@ pub(crate) fn embedded_module_name(bytes: &[u8]) -> Option<String> {
         .map(normalize_module)
 }
 
+struct ExportHeader {
+    ordinal_base: u32,
+    function_count: usize,
+    name_count: usize,
+    functions_rva: usize,
+    names_rva: usize,
+    ordinals_rva: usize,
+    directory_rva: u32,
+    directory_end: u32,
+}
+
 fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Option<ParsedExports> {
     let image = parse_memory_image(bytes).ok()?;
     let model = image.model();
-    let (directory_rva, directory_size) = directory(&image, EXPORT_DIRECTORY)?;
-    if directory_size < EXPORT_HEADER_SIZE as u32 {
-        return None;
-    }
-    let directory_offset = directory_rva as usize;
-    let ordinal_base = read_u32(bytes, directory_offset + 16)?;
-    let function_count = read_u32(bytes, directory_offset + 20)? as usize;
-    let name_count = read_u32(bytes, directory_offset + 24)? as usize;
-    if function_count == 0 || function_count > MAX_EXPORTS || name_count > MAX_EXPORTS {
-        return None;
-    }
-    let functions_rva = read_u32(bytes, directory_offset + 28)? as usize;
-    let names_rva = read_u32(bytes, directory_offset + 32)? as usize;
-    let ordinals_rva = read_u32(bytes, directory_offset + 36)? as usize;
-    checked_array(bytes, functions_rva, function_count, 4)?;
-    checked_array(bytes, names_rva, name_count, 4)?;
-    checked_array(bytes, ordinals_rva, name_count, 2)?;
-
-    let embedded =
-        read_u32(bytes, directory_offset + 12).and_then(|rva| read_ascii(bytes, rva as usize));
+    let header = export_header(&image, bytes)?;
+    let embedded = read_u32(bytes, header.directory_rva as usize + 12)
+        .and_then(|rva| read_ascii(bytes, rva as usize));
     let module = normalize_module(
         embedded
             .as_deref()
             .or(fallback_name)
             .unwrap_or("unknown.dll"),
     );
-    let mut names = HashMap::<usize, Vec<String>>::new();
-    for index in 0..name_count {
-        let name_rva = read_u32(bytes, names_rva.checked_add(index.checked_mul(4)?)?)?;
-        let ordinal_index = read_u16(bytes, ordinals_rva.checked_add(index.checked_mul(2)?)?)?;
-        let ordinal_index = usize::from(ordinal_index);
-        if ordinal_index >= function_count {
-            continue;
-        }
-        if let Some(name) = read_ascii(bytes, name_rva as usize) {
-            names.entry(ordinal_index).or_default().push(name);
-        }
-    }
+    let names = export_names(bytes, &header)?;
 
-    let directory_end = directory_rva.checked_add(directory_size)?;
     let mut direct = Vec::new();
     let mut forwarders = Vec::new();
-    for index in 0..function_count {
-        let function_rva = read_u32(bytes, functions_rva.checked_add(index.checked_mul(4)?)?)?;
+    for index in 0..header.function_count {
+        let function_rva = read_u32(
+            bytes,
+            header.functions_rva.checked_add(index.checked_mul(4)?)?,
+        )?;
         if function_rva == 0 {
             continue;
         }
-        let ordinal = ordinal_base.checked_add(u32::try_from(index).ok()?)?;
+        let ordinal = header
+            .ordinal_base
+            .checked_add(u32::try_from(index).ok()?)?;
         let aliases = names
             .get(&index)
             .cloned()
@@ -185,7 +172,7 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
                 name: (!alias.is_empty()).then_some(alias),
                 ordinal,
             };
-            if function_rva >= directory_rva && function_rva < directory_end {
+            if function_rva >= header.directory_rva && function_rva < header.directory_end {
                 if let Some(target) = read_ascii(bytes, function_rva as usize) {
                     forwarders.push(ForwardedExport {
                         source: symbol,
@@ -202,6 +189,55 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
         }
     }
     Some(ParsedExports { direct, forwarders })
+}
+
+fn export_header(image: &PeImage<'_>, bytes: &[u8]) -> Option<ExportHeader> {
+    let (directory_rva, directory_size) = directory(image, EXPORT_DIRECTORY)?;
+    if directory_size < EXPORT_HEADER_SIZE as u32 {
+        return None;
+    }
+    let directory_offset = directory_rva as usize;
+    let ordinal_base = read_u32(bytes, directory_offset + 16)?;
+    let function_count = read_u32(bytes, directory_offset + 20)? as usize;
+    let name_count = read_u32(bytes, directory_offset + 24)? as usize;
+    if function_count == 0 || function_count > MAX_EXPORTS || name_count > MAX_EXPORTS {
+        return None;
+    }
+    let functions_rva = read_u32(bytes, directory_offset + 28)? as usize;
+    let names_rva = read_u32(bytes, directory_offset + 32)? as usize;
+    let ordinals_rva = read_u32(bytes, directory_offset + 36)? as usize;
+    checked_array(bytes, functions_rva, function_count, 4)?;
+    checked_array(bytes, names_rva, name_count, 4)?;
+    checked_array(bytes, ordinals_rva, name_count, 2)?;
+    Some(ExportHeader {
+        ordinal_base,
+        function_count,
+        name_count,
+        functions_rva,
+        names_rva,
+        ordinals_rva,
+        directory_rva,
+        directory_end: directory_rva.checked_add(directory_size)?,
+    })
+}
+
+fn export_names(bytes: &[u8], header: &ExportHeader) -> Option<HashMap<usize, Vec<String>>> {
+    let mut names = HashMap::<usize, Vec<String>>::new();
+    for index in 0..header.name_count {
+        let name_rva = read_u32(bytes, header.names_rva.checked_add(index.checked_mul(4)?)?)?;
+        let ordinal_index = read_u16(
+            bytes,
+            header.ordinals_rva.checked_add(index.checked_mul(2)?)?,
+        )?;
+        let ordinal_index = usize::from(ordinal_index);
+        if ordinal_index >= header.function_count {
+            continue;
+        }
+        if let Some(name) = read_ascii(bytes, name_rva as usize) {
+            names.entry(ordinal_index).or_default().push(name);
+        }
+    }
+    Some(names)
 }
 
 fn resolve_forwarders(

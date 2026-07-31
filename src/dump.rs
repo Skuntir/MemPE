@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::memory::{Capture, CapturedImage};
+use crate::memory::{Capture, CapturedImage, RawRegion};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
 use crate::pe::{self, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage};
 use crate::process::TargetProcess;
@@ -27,15 +28,29 @@ pub(crate) struct ArtifactInfo {
     pub(crate) entry_section: Option<String>,
     pub(crate) repaired_debug_entries: usize,
     pub(crate) fixed_image_base: bool,
+    pub(crate) notable_cleared_directories: Vec<String>,
+    pub(crate) executable_flag_added: bool,
+    pub(crate) entry_unwind_covered: Option<bool>,
+    pub(crate) write_execute_sections: usize,
+    pub(crate) never_decrypted_sections: usize,
     pub(crate) resident_pages: usize,
     pub(crate) private_pages: usize,
     pub(crate) unlinked: bool,
+    pub(crate) path_mismatch: bool,
     pub(crate) embedded: bool,
+    pub(crate) raw_region: bool,
     pub(crate) hidden: bool,
     pub(crate) is_main: bool,
 }
 
 impl ArtifactInfo {
+    fn raw(base: usize) -> Self {
+        let mut info = Self::embedded(base, PeKind::Pe32Plus);
+        info.embedded = false;
+        info.raw_region = true;
+        info
+    }
+
     fn embedded(base: usize, kind: PeKind) -> Self {
         Self {
             base,
@@ -54,10 +69,17 @@ impl ArtifactInfo {
             entry_section: None,
             repaired_debug_entries: 0,
             fixed_image_base: false,
+            notable_cleared_directories: Vec::new(),
+            executable_flag_added: false,
+            entry_unwind_covered: None,
+            write_execute_sections: 0,
+            never_decrypted_sections: 0,
             resident_pages: 0,
             private_pages: 0,
             unlinked: false,
+            path_mismatch: false,
             embedded: true,
+            raw_region: false,
             hidden: false,
             is_main: false,
         }
@@ -85,9 +107,14 @@ pub(crate) struct DumpSummary {
     pub(crate) tls_callbacks: usize,
     pub(crate) repaired_debug_entries: usize,
     pub(crate) fixed_image_bases: usize,
+    pub(crate) notable_cleared_directories: BTreeSet<String>,
+    pub(crate) executable_flags_added: usize,
     pub(crate) resident_pages: usize,
     pub(crate) private_pages: usize,
     pub(crate) unlinked_images: usize,
+    pub(crate) path_mismatches: usize,
+    pub(crate) never_decrypted_sections: usize,
+    pub(crate) raw_regions: usize,
     pub(crate) embedded_pes: usize,
 }
 
@@ -144,7 +171,12 @@ impl DumpOutcome {
             || self.summary.renamed_sections > 0
             || self.summary.repaired_debug_entries > 0
             || self.summary.fixed_image_bases > 0
+            || self.summary.executable_flags_added > 0
+            || !self.summary.notable_cleared_directories.is_empty()
             || self.summary.unlinked_images > 0
+            || self.summary.path_mismatches > 0
+            || self.summary.never_decrypted_sections > 0
+            || self.summary.raw_regions > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
             || self.executable_non_image_allocations > self.hidden_non_image_images
@@ -161,6 +193,10 @@ impl DumpSummary {
     }
 
     fn add(&mut self, info: &ArtifactInfo) {
+        if info.raw_region {
+            self.raw_regions = self.raw_regions.saturating_add(1);
+            return;
+        }
         if info.embedded {
             self.embedded_pes = self.embedded_pes.saturating_add(1);
             return;
@@ -192,11 +228,22 @@ impl DumpSummary {
         self.fixed_image_bases = self
             .fixed_image_bases
             .saturating_add(usize::from(info.fixed_image_base));
+        self.executable_flags_added = self
+            .executable_flags_added
+            .saturating_add(usize::from(info.executable_flag_added));
+        self.notable_cleared_directories
+            .extend(info.notable_cleared_directories.iter().cloned());
         self.resident_pages = self.resident_pages.saturating_add(info.resident_pages);
         self.private_pages = self.private_pages.saturating_add(info.private_pages);
         self.unlinked_images = self
             .unlinked_images
             .saturating_add(usize::from(info.unlinked));
+        self.path_mismatches = self
+            .path_mismatches
+            .saturating_add(usize::from(info.path_mismatch));
+        self.never_decrypted_sections = self
+            .never_decrypted_sections
+            .saturating_add(info.never_decrypted_sections);
     }
 }
 
@@ -207,6 +254,8 @@ pub(crate) fn build(
 ) -> BuildReport {
     let executable_non_image_allocations = capture.executable_non_image_allocations;
     let hidden_non_image_images = capture.images.iter().filter(|image| image.hidden).count();
+    let carve_regions = capture.carve_regions;
+    let raw_regions = capture.raw_regions;
     let mut images = capture.images;
     prepare_images(&mut images);
 
@@ -231,6 +280,8 @@ pub(crate) fn build(
         });
         return report;
     }
+    push_region_embedded(&carve_regions, &mut report);
+    push_raw_regions(&raw_regions, &mut report);
     for image in images {
         push_embedded(target, &image, &mut report);
         let validates_manual_entry_point = image.is_main && entry_point.is_some();
@@ -240,6 +291,44 @@ pub(crate) fn build(
         }
     }
     report
+}
+
+fn push_region_embedded(regions: &[RawRegion], report: &mut BuildReport) {
+    for region in regions {
+        for (index, embedded) in pe::carve_embedded(&region.bytes).into_iter().enumerate() {
+            let Some(bytes) = copy_range(&region.bytes, embedded.offset, embedded.length) else {
+                continue;
+            };
+            report.files.push(OutputFile {
+                preferred_name: format!(
+                    "region-{:016X}.embed{}.{}",
+                    region.base,
+                    index.saturating_add(1),
+                    embedded.extension
+                ),
+                bytes,
+                context: ArtifactInfo::embedded(
+                    region.base.saturating_add(embedded.offset),
+                    embedded.kind,
+                ),
+            });
+        }
+    }
+}
+
+fn push_raw_regions(regions: &[RawRegion], report: &mut BuildReport) {
+    for region in regions {
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(region.bytes.len()).is_err() {
+            continue;
+        }
+        bytes.extend_from_slice(&region.bytes);
+        report.files.push(OutputFile {
+            preferred_name: format!("region.{:016X}.{:X}.raw", region.base, bytes.len()),
+            bytes,
+            context: ArtifactInfo::raw(region.base),
+        });
+    }
 }
 
 fn push_embedded(target: &TargetProcess, image: &CapturedImage, report: &mut BuildReport) {
@@ -368,9 +457,16 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         entry_section: rebuilt.entry_section.clone(),
         repaired_debug_entries: rebuilt.repaired_debug_entries,
         fixed_image_base: rebuilt.fixed_image_base,
+        notable_cleared_directories: rebuilt.notable_cleared_directories.clone(),
+        executable_flag_added: rebuilt.executable_flag_added,
+        entry_unwind_covered: rebuilt.entry_unwind_covered,
+        write_execute_sections: rebuilt.write_execute_sections,
+        never_decrypted_sections: rebuilt.never_decrypted_sections,
         resident_pages: image.resident_pages,
         private_pages: image.private_pages,
         unlinked: !image.linked && !image.hidden,
+        path_mismatch: image.path_mismatch,
+        raw_region: false,
         embedded: false,
         hidden: image.hidden,
         is_main: image.is_main,
@@ -418,6 +514,7 @@ fn rebuild_image(
         None,
         exports,
         entry_point,
+        &image.page_flags,
     ) {
         Ok(rebuilt) => Ok(rebuilt),
         Err(memory_error) => rebuild_with_disk_headers(image, exports, entry_point, memory_error),
@@ -433,6 +530,18 @@ fn rebuild_with_disk_headers(
     let Some(path) = &image.path else {
         return Err(memory_error);
     };
+    if !image.image_backed {
+        return Err(AppError::new(format!(
+            "{memory_error}; refusing disk headers from {}: the memory at this base is no longer image-backed",
+            path.display()
+        )));
+    }
+    if image.path_mismatch {
+        return Err(AppError::new(format!(
+            "{memory_error}; refusing disk headers from {}: a different file is mapped at this base",
+            path.display()
+        )));
+    }
     let disk_headers = read_disk_headers(path).map_err(|disk_error| {
         AppError::new(format!(
             "{memory_error}; could not read disk headers from {}: {disk_error}",
@@ -446,6 +555,7 @@ fn rebuild_with_disk_headers(
         Some(&disk_headers),
         exports,
         entry_point,
+        &image.page_flags,
     )
 }
 
@@ -509,10 +619,17 @@ mod tests {
                 entry_section: None,
                 repaired_debug_entries: 1,
                 fixed_image_base: true,
+                notable_cleared_directories: Vec::new(),
+                executable_flag_added: false,
+                entry_unwind_covered: None,
+                write_execute_sections: 0,
+                never_decrypted_sections: 0,
                 resident_pages: 8,
                 private_pages: 3,
                 unlinked: false,
+                path_mismatch: false,
                 embedded: false,
+                raw_region: false,
                 hidden,
                 is_main,
             },
