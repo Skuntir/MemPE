@@ -102,14 +102,33 @@ impl ExportIndex {
         self.stats
     }
 
-    pub(crate) fn resolve(&self, address: usize) -> Option<(&ResolvedExport, bool)> {
+    pub(crate) fn resolve(&self, address: usize) -> Option<Resolved<'_>> {
         let symbols = self.addresses.get(&address)?;
-        let first = symbols.first()?;
+        let symbol = undecorated(symbols).or_else(|| symbols.first())?;
         let ambiguous = symbols
             .iter()
-            .any(|symbol| !symbol.module.eq_ignore_ascii_case(&first.module));
-        Some((first, ambiguous))
+            .any(|other| !other.module.eq_ignore_ascii_case(&symbol.module));
+        Some(Resolved {
+            symbol,
+            ambiguous,
+            aliased: symbols.len() > 1 && !ambiguous,
+        })
     }
+}
+
+pub(crate) struct Resolved<'a> {
+    pub(crate) symbol: &'a ResolvedExport,
+    pub(crate) ambiguous: bool,
+    pub(crate) aliased: bool,
+}
+
+fn undecorated(symbols: &[ResolvedExport]) -> Option<&ResolvedExport> {
+    symbols.iter().find(|symbol| {
+        symbol
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.starts_with('?'))
+    })
 }
 
 pub(crate) fn embedded_module_name(bytes: &[u8]) -> Option<String> {
@@ -368,7 +387,68 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{Definitions, ExportKey, parse_forward_target};
+    use super::{Definitions, ExportIndex, ExportKey, ResolvedExport, parse_forward_target};
+
+    fn export(name: &str, module: &str) -> ResolvedExport {
+        ResolvedExport {
+            module: module.to_owned(),
+            name: Some(name.to_owned()),
+            ordinal: 1,
+        }
+    }
+
+    fn index_with(address: usize, symbols: Vec<ResolvedExport>) -> ExportIndex {
+        let mut index = ExportIndex::default();
+        index.addresses.insert(address, symbols);
+        index
+    }
+
+    #[test]
+    fn prefers_an_undecorated_alias_over_a_mangled_one() -> Result<(), Box<dyn std::error::Error>> {
+        let index = index_with(
+            0x1000,
+            vec![
+                export(
+                    "?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ",
+                    "MSVCP140.dll",
+                ),
+                export("_Thrd_id", "MSVCP140.dll"),
+            ],
+        );
+
+        let found = index.resolve(0x1000).ok_or("address is indexed")?;
+
+        assert_eq!(found.symbol.name.as_deref(), Some("_Thrd_id"));
+        assert!(found.aliased);
+        assert!(!found.ambiguous);
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_the_only_name_when_nothing_aliases_it() -> Result<(), Box<dyn std::error::Error>> {
+        let index = index_with(0x2000, vec![export("?mangled@@YAXXZ", "one.dll")]);
+
+        let found = index.resolve(0x2000).ok_or("address is indexed")?;
+
+        assert_eq!(found.symbol.name.as_deref(), Some("?mangled@@YAXXZ"));
+        assert!(!found.aliased);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_cross_module_collisions_as_ambiguous_not_aliased()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = index_with(
+            0x3000,
+            vec![export("shared", "one.dll"), export("shared", "two.dll")],
+        );
+
+        let found = index.resolve(0x3000).ok_or("address is indexed")?;
+
+        assert!(found.ambiguous);
+        assert!(!found.aliased);
+        Ok(())
+    }
 
     #[test]
     fn ignores_a_zero_export_name_rva() {

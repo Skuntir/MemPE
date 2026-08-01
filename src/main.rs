@@ -216,6 +216,12 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
             unwind_note(main.context.entry_unwind_covered)
         ),
     );
+    if main.context.declared_iat_slots > 0 {
+        console.field(
+            "IAT",
+            format_args!("{} slots declared", main.context.declared_iat_slots),
+        );
+    }
     if main.context.private_pages > 0 {
         console.field(
             "Runtime",
@@ -255,14 +261,17 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
     );
     console.field(
         "Imports",
-        format_args!("{} recovered", outcome.summary.imports_rebuilt),
+        format_args!(
+            "{} newly recovered across {} images",
+            outcome.summary.imports_rebuilt, outcome.summary.rebuilt_images
+        ),
     );
     if outcome.summary.unresolved_delay > 0 {
         console.field(
             "Delay",
             format_args!(
-                "{} declared but not called yet",
-                outcome.summary.unresolved_delay
+                "{} declared but not called yet, across {} images",
+                outcome.summary.unresolved_delay, outcome.summary.rebuilt_images
             ),
         );
     }
@@ -322,7 +331,7 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
     console.warning(format_args!("Notable directories cleared: {names}"));
 }
 
-fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 13] {
+fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 15] {
     [
         (summary.unreadable_pages, "Unreadable pages zero-filled"),
         (
@@ -369,6 +378,14 @@ fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str);
         (
             summary.path_mismatches,
             "Images mapped from a different file than the loader reports",
+        ),
+        (
+            summary.invalid_pdata_sections,
+            "Sections named .pdata that hold no valid runtime-function table, so their contents are not real",
+        ),
+        (
+            summary.aliased_names,
+            "Import names picked from several equally valid export aliases",
         ),
     ]
 }

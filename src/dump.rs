@@ -23,6 +23,9 @@ pub(crate) struct ArtifactInfo {
     pub(crate) imports_rebuilt: usize,
     pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
+    pub(crate) aliased_names: usize,
+    pub(crate) declared_iat_slots: usize,
+    pub(crate) invalid_pdata_sections: usize,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
     pub(crate) entry_point: u32,
@@ -65,6 +68,9 @@ impl ArtifactInfo {
             cleared_directories: 0,
             invalid_unwind_entries: 0,
             imports_rebuilt: 0,
+            aliased_names: 0,
+            declared_iat_slots: 0,
+            invalid_pdata_sections: 0,
             unresolved_delay: 0,
             ambiguous_imports: 0,
             renamed_sections: 0,
@@ -108,6 +114,9 @@ pub(crate) struct DumpSummary {
     pub(crate) imports_rebuilt: usize,
     pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
+    pub(crate) aliased_names: usize,
+    pub(crate) invalid_pdata_sections: usize,
+    pub(crate) rebuilt_images: usize,
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
@@ -206,6 +215,19 @@ impl DumpSummary {
         summary
     }
 
+    fn add_imports(&mut self, info: &ArtifactInfo) {
+        self.rebuilt_images = self.rebuilt_images.saturating_add(1);
+        self.imports_rebuilt = self.imports_rebuilt.saturating_add(info.imports_rebuilt);
+        self.unresolved_delay = self.unresolved_delay.saturating_add(info.unresolved_delay);
+        self.ambiguous_imports = self
+            .ambiguous_imports
+            .saturating_add(info.ambiguous_imports);
+        self.aliased_names = self.aliased_names.saturating_add(info.aliased_names);
+        self.invalid_pdata_sections = self
+            .invalid_pdata_sections
+            .saturating_add(info.invalid_pdata_sections);
+    }
+
     fn add(&mut self, info: &ArtifactInfo) {
         if info.raw_region {
             self.raw_regions = self.raw_regions.saturating_add(1);
@@ -218,6 +240,7 @@ impl DumpSummary {
             self.embedded_pes = self.embedded_pes.saturating_add(1);
             return;
         }
+        self.add_imports(info);
         self.dlls = self.dlls.saturating_add(usize::from(!info.is_main));
         self.hidden_images = self.hidden_images.saturating_add(usize::from(info.hidden));
         self.unreadable_pages = self.unreadable_pages.saturating_add(info.unreadable_pages);
@@ -230,11 +253,6 @@ impl DumpSummary {
         self.disk_header_repairs = self
             .disk_header_repairs
             .saturating_add(usize::from(info.disk_headers_used));
-        self.imports_rebuilt = self.imports_rebuilt.saturating_add(info.imports_rebuilt);
-        self.unresolved_delay = self.unresolved_delay.saturating_add(info.unresolved_delay);
-        self.ambiguous_imports = self
-            .ambiguous_imports
-            .saturating_add(info.ambiguous_imports);
         self.invalid_unwind_entries = self
             .invalid_unwind_entries
             .saturating_add(info.invalid_unwind_entries);
@@ -473,6 +491,9 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         cleared_directories: rebuilt.cleared_directories,
         invalid_unwind_entries: rebuilt.invalid_unwind_entries,
         imports_rebuilt: rebuilt.imports_rebuilt,
+        aliased_names: rebuilt.aliased_names,
+        declared_iat_slots: rebuilt.declared_iat_slots,
+        invalid_pdata_sections: rebuilt.invalid_pdata_sections,
         unresolved_delay: rebuilt.unresolved_delay,
         ambiguous_imports: rebuilt.ambiguous_imports,
         renamed_sections: rebuilt.renamed_sections,
@@ -637,6 +658,9 @@ mod tests {
                 cleared_directories: 1,
                 invalid_unwind_entries: 0,
                 imports_rebuilt: imports,
+                aliased_names: 0,
+                declared_iat_slots: 0,
+                invalid_pdata_sections: 0,
                 unresolved_delay: 0,
                 ambiguous_imports: 0,
                 renamed_sections: 1,

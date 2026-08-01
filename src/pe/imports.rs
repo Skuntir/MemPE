@@ -54,6 +54,7 @@ pub(super) struct ImportPlan {
     pub(super) groups: Vec<ImportGroup>,
     pub(super) recovered: usize,
     pub(super) ambiguous: usize,
+    pub(super) aliased_names: usize,
     pub(super) unresolved_delay: usize,
     pub(super) existing: Vec<u8>,
 }
@@ -286,7 +287,7 @@ fn scan_import_range(
             let Some(value) = read_pointer(memory, offset, width) else {
                 break;
             };
-            let Some((symbol, ambiguous)) =
+            let Some((symbol, ambiguous, aliased)) =
                 resolve_value(memory, observed_base, kind, value, exports)
             else {
                 break;
@@ -294,6 +295,9 @@ fn scan_import_range(
             if ambiguous {
                 plan.ambiguous = plan.ambiguous.saturating_add(1);
                 break;
+            }
+            if aliased {
+                plan.aliased_names = plan.aliased_names.saturating_add(1);
             }
             let Ok(slot_rva) = u32::try_from(offset) else {
                 break;
@@ -345,13 +349,17 @@ fn recover_referenced_imports(
         let Some(value) = read_pointer(memory, slot as usize, width) else {
             continue;
         };
-        let Some((symbol, ambiguous)) = resolve_value(memory, observed_base, kind, value, exports)
+        let Some((symbol, ambiguous, aliased)) =
+            resolve_value(memory, observed_base, kind, value, exports)
         else {
             continue;
         };
         if ambiguous {
             plan.ambiguous = plan.ambiguous.saturating_add(1);
             continue;
+        }
+        if aliased {
+            plan.aliased_names = plan.aliased_names.saturating_add(1);
         }
         entries.push((slot, symbol));
     }
@@ -577,11 +585,11 @@ fn resolve_value(
     kind: PeKind,
     value: usize,
     exports: &ExportIndex,
-) -> Option<(ResolvedExport, bool)> {
+) -> Option<(ResolvedExport, bool, bool)> {
     let mut value = value;
     for _hop in 0..=MAX_THUNK_DEPTH {
-        if let Some((symbol, ambiguous)) = exports.resolve(value) {
-            return Some((symbol.clone(), ambiguous));
+        if let Some(found) = exports.resolve(value) {
+            return Some((found.symbol.clone(), found.ambiguous, found.aliased));
         }
         let rva = value.checked_sub(observed_base)?;
         let next = match kind {
