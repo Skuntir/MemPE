@@ -15,7 +15,6 @@ const DEBUG_ENTRY_RAW_RVA: usize = 20;
 const DEBUG_ENTRY_RAW_POINTER: usize = 24;
 const MAX_DEBUG_ENTRIES: usize = 256;
 const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
-const BOUND_IMPORT_DIRECTORY: usize = 11;
 const DIRECTORY_COUNT: usize = 16;
 
 const DIRECTORY_NAMES: [&str; DIRECTORY_COUNT] = [
@@ -37,7 +36,7 @@ const DIRECTORY_NAMES: [&str; DIRECTORY_COUNT] = [
     "Reserved",
 ];
 
-const ROUTINE_DIRECTORIES: [usize; 2] = [SECURITY_DIRECTORY, BOUND_IMPORT_DIRECTORY];
+const ROUTINE_DIRECTORIES: [usize; 1] = [SECURITY_DIRECTORY];
 
 #[derive(Default)]
 pub(super) struct ClearedDirectories {
@@ -281,8 +280,8 @@ mod tests {
         assert_eq!(directory_name(4), "Certificate");
         assert_eq!(directory_name(99), "Unknown");
         assert!(!is_notable_directory(4));
-        assert!(!is_notable_directory(11));
         assert!(is_notable_directory(1));
         assert!(is_notable_directory(2));
+        assert!(is_notable_directory(11));
     }
 }

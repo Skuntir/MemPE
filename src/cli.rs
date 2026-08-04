@@ -8,18 +8,22 @@ const MAX_TRAILING_OPTIONS: usize = 4;
 
 pub const HELP: &str = "mempe - Windows PE memory dumper and rebuilder\n\n\
 Usage:\n\
-  mempe.exe -p <PID> [-e|--entry-point <RVA>] [--raw-regions]\n\
-  mempe.exe -w <program.exe> [-e|--entry-point <RVA>] [--raw-regions]\n\
+  mempe.exe -p <PID> [-e|--entry-point <RVA>] [--raw-regions] [--only <name>]\n\
+  mempe.exe -w <program.exe> [-e|--entry-point <RVA>] [--raw-regions] [--only <name>]\n\
   mempe.exe -h\n\n\
 -w waits up to 24 hours for a new matching process. Press Ctrl+C to stop.\n\
 --raw-regions also writes the untouched bytes of executable non-image\n\
-allocations that held no full PE. Off by default; it can add many files.\n";
+allocations that held no full PE. Off by default; it can add many files.\n\
+--only writes just the images matching a module name or a 0x-prefixed base\n\
+address. Every image is still captured and indexed, so imports resolve the\n\
+same as in a full dump.\n";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Request {
     pub command: Command,
     pub entry_point: Option<EntryPointRva>,
     pub raw_regions: bool,
+    pub only: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -64,6 +68,7 @@ where
         command,
         entry_point: options.entry_point,
         raw_regions: options.raw_regions,
+        only: options.only,
     }))
 }
 
@@ -93,6 +98,7 @@ fn parse_watch_name(value: OsString) -> AppResult<String> {
 struct TrailingOptions {
     entry_point: Option<EntryPointRva>,
     raw_regions: bool,
+    only: Option<String>,
 }
 
 fn parse_trailing_options(args: &mut impl Iterator<Item = OsString>) -> AppResult<TrailingOptions> {
@@ -106,6 +112,22 @@ fn parse_trailing_options(args: &mut impl Iterator<Item = OsString>) -> AppResul
                 return Err(AppError::new("--raw-regions was given twice"));
             }
             options.raw_regions = true;
+            continue;
+        }
+        if option == "--only" {
+            if options.only.is_some() {
+                return Err(AppError::new("--only was given twice"));
+            }
+            let value = args
+                .next()
+                .ok_or_else(|| AppError::new("--only needs a module name or base address"))?;
+            let name = value
+                .into_string()
+                .map_err(|_| AppError::new("--only value is not valid Unicode"))?;
+            if name.is_empty() {
+                return Err(AppError::new("--only value cannot be empty"));
+            }
+            options.only = Some(name);
             continue;
         }
         if option != "-e" && option != "--entry-point" {
@@ -193,6 +215,26 @@ mod tests {
         assert!(matches!(request.command, Command::Pid(_)));
         assert_eq!(request.entry_point, crate::pe::EntryPointRva::new(0x31A20));
         Ok(())
+    }
+
+    #[test]
+    fn parses_a_single_image_filter() -> Result<(), Box<dyn std::error::Error>> {
+        let request = parse(args(&["mempe", "-p", "4216", "--only", "explorer.exe"]))?
+            .ok_or("request is missing")?;
+
+        assert_eq!(request.only.as_deref(), Some("explorer.exe"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_empty_repeated_or_valueless_image_filter() {
+        let empty = parse(args(&["mempe", "-p", "4216", "--only", ""]));
+        let twice = parse(args(&["mempe", "-p", "4216", "--only", "a", "--only", "b"]));
+        let missing = parse(args(&["mempe", "-p", "4216", "--only"]));
+
+        assert!(empty.is_err());
+        assert!(twice.is_err());
+        assert!(missing.is_err());
     }
 
     #[test]

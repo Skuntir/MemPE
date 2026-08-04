@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+use windows::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ProcessSnapshotting::{
     HPSS, PSS_CAPTURE_VA_CLONE, PSS_CREATE_BREAKAWAY, PSS_CREATE_BREAKAWAY_OPTIONAL,
@@ -25,6 +26,7 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_CREATE_PROCESS, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
+use windows::core::PCWSTR;
 
 use crate::pe::RegionEvidence;
 use crate::process::{OwnedHandle, TargetProcess};
@@ -97,13 +99,18 @@ pub(crate) struct Capture {
     pub(crate) executable_non_image_allocations: usize,
     pub(crate) carve_regions: Vec<RawRegion>,
     pub(crate) raw_regions: Vec<RawRegion>,
+    pub(crate) unscanned_non_image_bytes: usize,
     pub(crate) main_image_missing: bool,
+    pub(crate) images_skipped: usize,
 }
 
 pub(crate) struct RawRegion {
     pub(crate) base: usize,
     pub(crate) bytes: Vec<u8>,
     pub(crate) unreadable_pages: usize,
+    pub(crate) committed: usize,
+    pub(crate) protections: u32,
+    pub(crate) executable: bool,
 }
 
 pub(crate) struct StabilityInfo {
@@ -264,7 +271,9 @@ pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Ca
         executable_non_image_allocations: captured.non_image_count,
         carve_regions: captured.carve_regions,
         raw_regions: captured.raw_regions,
+        unscanned_non_image_bytes: captured.unscanned_non_image_bytes,
         main_image_missing: captured.main_image_missing,
+        images_skipped: captured.images_skipped,
     })
 }
 
@@ -363,7 +372,47 @@ struct CapturedSpace {
     non_image_count: usize,
     carve_regions: Vec<RawRegion>,
     raw_regions: Vec<RawRegion>,
+    unscanned_non_image_bytes: usize,
     main_image_missing: bool,
+    images_skipped: usize,
+}
+
+fn read_all_images(
+    space: &AddressSpace,
+    target: &TargetProcess,
+    regions: &[MemoryRegion],
+    groups: BTreeMap<usize, ImageGroup>,
+    hidden: &[(usize, usize)],
+    main_base: Option<usize>,
+) -> AppResult<(Vec<CapturedImage>, usize)> {
+    let mut images = Vec::new();
+    images
+        .try_reserve_exact(groups.len().saturating_add(hidden.len()))
+        .map_err(|_| AppError::new("not enough memory for the image list"))?;
+    let mut total_size = 0usize;
+    let mut skipped = 0usize;
+    for (base, group) in groups {
+        let size = group.end.saturating_sub(base);
+        if size == 0 || size > MAX_IMAGE_SIZE {
+            continue;
+        }
+        if !claim_image_budget(&mut total_size, size, main_base == Some(base)) {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        let read = read_image(space, target, main_base, base, size, &group.regions, false)?;
+        images.push(read);
+    }
+    for (base, size) in hidden.iter().copied() {
+        if !claim_image_budget(&mut total_size, size, false) {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        let image_regions = regions_in_range(regions, base, size)?;
+        let read = read_image(space, target, main_base, base, size, &image_regions, true)?;
+        images.push(read);
+    }
+    Ok((images, skipped))
 }
 
 fn capture_from_space(
@@ -374,34 +423,13 @@ fn capture_from_space(
     let regions = space.regions()?;
     let non_image_allocations = executable_non_image_allocations(&regions);
     let non_image_count = non_image_allocations.len();
-    let groups = group_images(&regions, target)?;
+    let bases = image_bases(&regions, target);
+    let main_base = resolve_main_base(space, target, &bases);
+    let (groups, mut images_skipped) = group_images(&regions, &bases, main_base)?;
     let hidden = find_hidden_images(space, &regions, &non_image_allocations)?;
-    let mut images = Vec::new();
-    images
-        .try_reserve_exact(groups.len().saturating_add(hidden.len()))
-        .map_err(|_| AppError::new("not enough memory for the image list"))?;
-
-    let mut total_size = 0usize;
-    for (base, group) in groups {
-        let size = group.end.saturating_sub(base);
-        if size == 0 || size > MAX_IMAGE_SIZE {
-            continue;
-        }
-        add_image_size(&mut total_size, size)?;
-        images.push(read_image(
-            space,
-            target,
-            base,
-            size,
-            &group.regions,
-            false,
-        )?);
-    }
-    for (base, size) in hidden.iter().copied() {
-        add_image_size(&mut total_size, size)?;
-        let image_regions = regions_in_range(&regions, base, size)?;
-        images.push(read_image(space, target, base, size, &image_regions, true)?);
-    }
+    let (images, over_budget) =
+        read_all_images(space, target, &regions, groups, &hidden, main_base)?;
+    images_skipped = images_skipped.saturating_add(over_budget);
     if images.is_empty() {
         return Err(AppError::new(
             "no image allocations were present in the captured address space",
@@ -409,20 +437,24 @@ fn capture_from_space(
     }
     let main_image_missing = main_image_is_missing(&images);
     let carve_allocations = readable_non_image_allocations(space, &regions, &non_image_allocations);
-    let carve_regions =
-        read_allocations(space, &regions, &carve_allocations, MAX_NON_IMAGE_RW_BYTES);
-    let raw_regions = if want_raw_regions {
+    let carve = read_allocations(space, &regions, &carve_allocations, MAX_NON_IMAGE_RW_BYTES);
+    let raw = if want_raw_regions {
         let unclaimed = unclaimed_executable_allocations(&regions, &non_image_allocations, &hidden);
         read_allocations(space, &regions, &unclaimed, MAX_RAW_REGION_BYTES)
     } else {
-        Vec::new()
+        ScannedAllocations {
+            regions: Vec::new(),
+            skipped: 0,
+        }
     };
     Ok(CapturedSpace {
         images,
         non_image_count,
-        carve_regions,
-        raw_regions,
+        carve_regions: carve.regions,
+        raw_regions: raw.regions,
+        unscanned_non_image_bytes: carve.skipped.saturating_add(raw.skipped),
         main_image_missing,
+        images_skipped,
     })
 }
 
@@ -471,56 +503,72 @@ fn unclaimed_executable_allocations(
         .collect()
 }
 
+struct ScannedAllocations {
+    regions: Vec<RawRegion>,
+    skipped: usize,
+}
+
+#[derive(Default)]
+struct AllocationExtent {
+    end: usize,
+    committed: usize,
+    protections: u32,
+    executable: bool,
+}
+
 fn read_allocations(
     space: &AddressSpace,
     regions: &[MemoryRegion],
     allocations: &BTreeSet<usize>,
     budget: usize,
-) -> Vec<RawRegion> {
-    let mut extents = BTreeMap::<usize, usize>::new();
+) -> ScannedAllocations {
+    let mut extents = BTreeMap::<usize, AllocationExtent>::new();
     for region in regions {
         if region.state != MEM_COMMIT.0 || !allocations.contains(&region.allocation_base) {
             continue;
         }
-        let end = region.base.saturating_add(region.size);
-        extents
-            .entry(region.allocation_base)
-            .and_modify(|current| *current = (*current).max(end))
-            .or_insert(end);
+        let extent = extents.entry(region.allocation_base).or_default();
+        extent.end = extent.end.max(region.base.saturating_add(region.size));
+        extent.committed = extent.committed.saturating_add(region.size);
+        extent.protections |= region.protect;
+        extent.executable |= is_executable(region.protect);
     }
     let mut remaining = budget;
+    let mut skipped = 0usize;
     let mut collected = Vec::new();
-    for (base, end) in extents.into_iter().take(MAX_IMAGES) {
-        let size = end.saturating_sub(base).min(remaining);
-        if size == 0 {
-            break;
-        }
+    for (base, extent) in extents.into_iter().take(MAX_IMAGES) {
+        let size = extent.end.saturating_sub(base).min(remaining);
         let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(size).is_err() {
-            break;
+        if size == 0 || bytes.try_reserve_exact(size).is_err() {
+            skipped = skipped.saturating_add(extent.committed);
+            continue;
         }
         bytes.resize(size, 0);
         let unreadable_pages = read_region(space, base, &mut bytes);
         remaining = remaining.saturating_sub(size);
+        skipped = skipped.saturating_add(extent.committed.saturating_sub(size));
         collected.push(RawRegion {
             base,
             bytes,
             unreadable_pages,
+            committed: extent.committed,
+            protections: extent.protections,
+            executable: extent.executable,
         });
     }
-    collected
+    ScannedAllocations {
+        regions: collected,
+        skipped,
+    }
 }
 
-fn add_image_size(total: &mut usize, size: usize) -> AppResult<()> {
-    *total = total
-        .checked_add(size)
-        .ok_or_else(|| AppError::new("combined image size overflowed"))?;
-    if *total > MAX_TOTAL_IMAGE_BYTES {
-        return Err(AppError::new(
-            "combined in-memory image data exceeds the 4 GiB safety limit",
-        ));
+fn claim_image_budget(total: &mut usize, size: usize, mandatory: bool) -> bool {
+    let next = total.saturating_add(size);
+    if !mandatory && next > MAX_TOTAL_IMAGE_BYTES {
+        return false;
     }
-    Ok(())
+    *total = next;
+    true
 }
 
 fn list_regions(handle: HANDLE) -> AppResult<Vec<MemoryRegion>> {
@@ -561,30 +609,39 @@ fn list_regions(handle: HANDLE) -> AppResult<Vec<MemoryRegion>> {
     Err(AppError::new("too many memory regions were returned"))
 }
 
-fn group_images(
-    regions: &[MemoryRegion],
-    target: &TargetProcess,
-) -> AppResult<BTreeMap<usize, ImageGroup>> {
-    let mut image_bases = BTreeSet::new();
+fn image_bases(regions: &[MemoryRegion], target: &TargetProcess) -> BTreeSet<usize> {
+    let mut bases = BTreeSet::new();
     for region in regions {
         if region.kind == MEM_IMAGE.0 && region.allocation_base != 0 {
-            image_bases.insert(region.allocation_base);
+            bases.insert(region.allocation_base);
         }
     }
     for module in &target.modules {
         if module.base != 0 {
-            image_bases.insert(module.base);
+            bases.insert(module.base);
         }
     }
-    if image_bases.len() > MAX_IMAGES {
-        return Err(AppError::new(
-            "in-memory image count exceeds the 4096-image safety limit",
-        ));
+    bases
+}
+
+fn group_images(
+    regions: &[MemoryRegion],
+    bases: &BTreeSet<usize>,
+    main_base: Option<usize>,
+) -> AppResult<(BTreeMap<usize, ImageGroup>, usize)> {
+    let mut kept = bases
+        .iter()
+        .copied()
+        .take(MAX_IMAGES)
+        .collect::<BTreeSet<_>>();
+    if let Some(base) = main_base.filter(|base| bases.contains(base)) {
+        kept.insert(base);
     }
+    let skipped = bases.len().saturating_sub(kept.len());
 
     let mut groups = BTreeMap::<usize, ImageGroup>::new();
     for region in regions {
-        if !image_bases.contains(&region.allocation_base) {
+        if !kept.contains(&region.allocation_base) {
             continue;
         }
         let end = region
@@ -595,7 +652,7 @@ fn group_images(
         group.end = group.end.max(end);
         group.regions.push(*region);
     }
-    Ok(groups)
+    Ok((groups, skipped))
 }
 
 struct RegionScan {
@@ -604,9 +661,38 @@ struct RegionScan {
     image_backed: bool,
 }
 
+fn resolve_main_base(
+    space: &AddressSpace,
+    target: &TargetProcess,
+    bases: &BTreeSet<usize>,
+) -> Option<usize> {
+    if let Some(module) = &target.main_module {
+        return Some(module.base);
+    }
+    let drives = drive_map();
+    let wanted = target.path.to_string_lossy().into_owned();
+    let mut by_path = None;
+    let mut by_name = Vec::new();
+    for base in bases {
+        let Some(device) = mapped_file_name(space.handle(), *base) else {
+            continue;
+        };
+        if to_dos_path(&device, &drives).is_some_and(|path| path.eq_ignore_ascii_case(&wanted)) {
+            if by_path.is_some() {
+                return None;
+            }
+            by_path = Some(*base);
+        } else if basename(&device).eq_ignore_ascii_case(&target.name) {
+            by_name.push(*base);
+        }
+    }
+    by_path.or_else(|| by_name.first().copied().filter(|_| by_name.len() == 1))
+}
+
 fn read_image(
     space: &AddressSpace,
     target: &TargetProcess,
+    main_base: Option<usize>,
     base: usize,
     size: usize,
     regions: &[MemoryRegion],
@@ -629,7 +715,7 @@ fn read_image(
         unreadable_pages: scan.unreadable_pages,
         name: module.map(|value| value.name.clone()),
         path: module.map(|value| value.path.clone()),
-        is_main: base == target.main_module.base,
+        is_main: main_base == Some(base),
         hidden,
         linked: module.is_some(),
         image_backed: scan.image_backed,
@@ -727,11 +813,20 @@ fn annotate_images(
     images: &mut [CapturedImage],
     coverage: &mut BTreeMap<usize, PageCoverage>,
 ) {
+    let drives = drive_map();
     for image in images {
         let mapped = mapped_file_name(process, image.base);
-        image.path_mismatch = basename_mismatch(image.name.as_deref(), mapped.as_deref());
+        let actual = mapped
+            .as_deref()
+            .and_then(|device| to_dos_path(device, &drives));
+        image.path_mismatch = match (&image.path, &actual) {
+            (Some(reported), Some(actual)) => {
+                !reported.as_os_str().eq_ignore_ascii_case(actual.as_str())
+            }
+            _ => basename_mismatch(image.name.as_deref(), mapped.as_deref()),
+        };
         if image.name.is_none() || image.path_mismatch {
-            image.name = mapped;
+            image.name = mapped.as_deref().map(|path| basename(path).to_owned());
         }
         if let Some(pages) = coverage.remove(&image.base) {
             image.resident_pages = pages.resident;
@@ -743,9 +838,13 @@ fn annotate_images(
 
 fn basename_mismatch(reported: Option<&str>, mapped: Option<&str>) -> bool {
     match (reported, mapped) {
-        (Some(reported), Some(mapped)) => !reported.eq_ignore_ascii_case(mapped),
+        (Some(reported), Some(mapped)) => !reported.eq_ignore_ascii_case(basename(mapped)),
         _ => false,
     }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
 fn mapped_file_name(process: HANDLE, base: usize) -> Option<String> {
@@ -753,8 +852,40 @@ fn mapped_file_name(process: HANDLE, base: usize) -> Option<String> {
     let length = unsafe { K32GetMappedFileNameW(process, base as *const c_void, &mut buffer) };
     let used = usize::try_from(length).ok()?;
     let path = String::from_utf16_lossy(buffer.get(..used)?);
-    let name = path.rsplit(['\\', '/']).next()?;
-    (!name.is_empty()).then(|| name.to_owned())
+    (!path.is_empty()).then_some(path)
+}
+
+fn drive_map() -> Vec<(String, String)> {
+    let mask = unsafe { GetLogicalDrives() };
+    let mut map = Vec::new();
+    for index in 0..26u32 {
+        if mask & (1u32 << index) == 0 {
+            continue;
+        }
+        let Some(letter) = char::from_u32(u32::from(b'A').saturating_add(index)) else {
+            continue;
+        };
+        let dos = format!("{letter}:");
+        let wide = [u16::from(letter as u8), u16::from(b':'), 0u16];
+        let mut target = [0u16; MAX_MAPPED_PATH_CHARS];
+        let length = unsafe { QueryDosDeviceW(PCWSTR(wide.as_ptr()), Some(target.as_mut_slice())) };
+        if length == 0 {
+            continue;
+        }
+        let end = target.iter().position(|unit| *unit == 0).unwrap_or(0);
+        let device = String::from_utf16_lossy(target.get(..end).unwrap_or_default());
+        if !device.is_empty() {
+            map.push((device, dos));
+        }
+    }
+    map
+}
+
+fn to_dos_path(device: &str, map: &[(String, String)]) -> Option<String> {
+    map.iter().find_map(|(prefix, letter)| {
+        let rest = device.strip_prefix(prefix.as_str())?;
+        rest.starts_with('\\').then(|| format!("{letter}{rest}"))
+    })
 }
 
 fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
@@ -1007,14 +1138,18 @@ fn win32_status(action: &str, status: u32) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use windows::Win32::System::Memory::{
-        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, PAGE_EXECUTE_READ, PAGE_GUARD,
+        PAGE_READONLY, PAGE_READWRITE,
     };
 
     use super::{
-        CapturedImage, MAX_STABILITY_READS, MemoryRegion, PAGE_SIZE, allocation_extents,
-        basename_mismatch, executable_non_image_allocations, main_image_is_missing,
-        regions_in_range, stability_pages,
+        CapturedImage, MAX_IMAGES, MAX_STABILITY_READS, MAX_TOTAL_IMAGE_BYTES, MemoryRegion,
+        PAGE_SIZE, allocation_extents, basename_mismatch, claim_image_budget,
+        executable_non_image_allocations, group_images, is_executable, main_image_is_missing,
+        regions_in_range, stability_pages, to_dos_path,
     };
 
     fn captured_image(is_main: bool) -> CapturedImage {
@@ -1053,6 +1188,61 @@ mod tests {
     #[test]
     fn main_image_missing_is_true_for_an_empty_capture() {
         assert!(main_image_is_missing(&[]));
+    }
+
+    #[test]
+    fn executability_is_a_property_of_one_protection_value_not_of_a_mask() {
+        let mixed = PAGE_READONLY.0 | PAGE_EXECUTE_READ.0;
+
+        assert!(is_executable(PAGE_EXECUTE_READ.0));
+        assert!(!is_executable(mixed));
+        assert!(!is_executable(PAGE_EXECUTE_READ.0 | PAGE_GUARD.0));
+    }
+
+    #[test]
+    fn a_device_name_is_not_confused_with_a_longer_one_sharing_its_prefix() {
+        let map = [
+            ("\\Device\\HarddiskVolume1".to_string(), "C:".to_string()),
+            ("\\Device\\HarddiskVolume11".to_string(), "D:".to_string()),
+        ];
+
+        assert_eq!(
+            to_dos_path("\\Device\\HarddiskVolume11\\app\\a.dll", &map).as_deref(),
+            Some("D:\\app\\a.dll")
+        );
+        assert_eq!(
+            to_dos_path("\\Device\\HarddiskVolume1\\app\\a.dll", &map).as_deref(),
+            Some("C:\\app\\a.dll")
+        );
+        assert_eq!(to_dos_path("\\Device\\Mup\\share\\a.dll", &map), None);
+    }
+
+    #[test]
+    fn the_main_image_is_captured_even_when_the_byte_budget_is_spent() {
+        let mut total = MAX_TOTAL_IMAGE_BYTES;
+
+        assert!(!claim_image_budget(&mut total, PAGE_SIZE, false));
+        assert!(claim_image_budget(&mut total, PAGE_SIZE, true));
+    }
+
+    #[test]
+    fn truncating_the_image_count_keeps_the_main_image_and_counts_the_rest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let regions = (0..MAX_IMAGES + 3)
+            .map(|index| region(PAGE_SIZE.saturating_mul(index + 1), PAGE_SIZE))
+            .collect::<Vec<_>>();
+        let bases = regions
+            .iter()
+            .map(|region| region.base)
+            .collect::<BTreeSet<_>>();
+        let last = PAGE_SIZE.saturating_mul(MAX_IMAGES + 3);
+
+        let (groups, skipped) = group_images(&regions, &bases, Some(last))?;
+
+        assert_eq!(skipped, 2);
+        assert!(groups.contains_key(&last));
+        assert_eq!(groups.len(), MAX_IMAGES + 1);
+        Ok(())
     }
 
     fn region(base: usize, size: usize) -> MemoryRegion {

@@ -18,7 +18,7 @@ use directories::{
     ClearedDirectories, clear_bad_directories, clear_directory, clear_dynamic_base,
     repair_debug_directory,
 };
-use exception::{UnwindRanges, entry_unwind_covered, repair_exception_directory};
+use exception::{UnwindRanges, entry_unwind_covered, repair_exception_directory, unwind_layout};
 use headers::{finalize_output, write_core_header_fields};
 use import_section::append_import_section;
 use observe::{
@@ -50,6 +50,7 @@ pub(crate) struct RebuiltImage {
     pub(crate) aliased_names: usize,
     pub(crate) declared_iat_slots: usize,
     pub(crate) invalid_pdata_sections: usize,
+    pub(crate) managed: bool,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
     pub(crate) entry_point: u32,
@@ -101,10 +102,8 @@ pub(crate) fn rebuild(
     )?;
     let (final_entry_point, executable_flag_added) =
         finalize_output(&mut output, model, entry_point)?;
-    let bogus_pdata = invalid_pdata_sections(&output, model, &layouts, header_size);
 
     Ok(RebuiltImage {
-        bytes: output,
         kind: model.kind,
         is_dll: model.is_dll,
         section_count: model.sections.len().saturating_add(usize::from(written)),
@@ -118,7 +117,8 @@ pub(crate) fn rebuild(
         ambiguous_imports: import_plan.ambiguous,
         aliased_names: import_plan.aliased_names,
         declared_iat_slots: declared_iat_slots(&image, model),
-        invalid_pdata_sections: bogus_pdata,
+        invalid_pdata_sections: invalid_pdata_sections(&output, model, &layouts, header_size),
+        managed: unwind_layout(&output, model).is_managed(),
         renamed_sections,
         tls_callbacks: count_tls_callbacks(&image, observed_base),
         entry_point: final_entry_point,
@@ -130,6 +130,7 @@ pub(crate) fn rebuild(
         write_execute_sections: count_write_execute_sections(&layouts, regions),
         never_decrypted_sections: never_decrypted_sections(memory, &layouts, page_flags),
         absent_sections: absent_sections(memory, &layouts),
+        bytes: output,
     })
 }
 
@@ -235,6 +236,54 @@ mod tests {
         EntryPointRva, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, PeKind,
         RegionEvidence,
     };
+
+    #[test]
+    fn names_a_notable_directory_it_had_to_clear() -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let debug = 0x98 + 112 + 6 * 8;
+        put_u32(&mut memory, debug, 0x5000);
+        put_u32(&mut memory, debug + 4, 0x28);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        )?;
+
+        assert_eq!(
+            rebuilt.notable_cleared_directories,
+            vec!["Debug".to_owned()]
+        );
+        assert_eq!(get_u32(&rebuilt.bytes, debug), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_disk_headers_that_claim_more_image_than_was_captured() {
+        let mut disk = fixture_pe64();
+        put_u32(&mut disk, 0x98 + 56, 0x9000);
+        let mut memory = disk.clone();
+        put_u32(&mut memory, 0x80, 0);
+
+        let result = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            Some(&disk),
+            &ExportIndex::default(),
+            None,
+            &[],
+        );
+
+        assert_eq!(
+            result.err().map(|error| error.to_string()),
+            Some("disk SizeOfImage exceeds the captured image".to_owned())
+        );
+    }
 
     #[test]
     fn rebuilds_a_memory_layout_pe32_plus() -> Result<(), Box<dyn std::error::Error>> {
@@ -421,6 +470,64 @@ mod tests {
 
         assert_eq!(rebuilt.invalid_unwind_entries, 1);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_managed_unwind_entries_the_native_check_would_reject()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let optional = 0x98;
+        put_u32(&mut memory, optional + 112 + 3 * 8, 0x1100);
+        put_u32(&mut memory, optional + 112 + 3 * 8 + 4, 12);
+        put_u32(&mut memory, 0x1100, 0x1000);
+        put_u32(&mut memory, 0x1104, 0x1010);
+        put_u32(&mut memory, 0x1108, 0x1200);
+        put_u32(&mut memory, optional + 112 + 14 * 8, 0x1000);
+        put_u32(&mut memory, optional + 112 + 14 * 8 + 4, 0x48);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        )?;
+
+        assert_eq!(rebuilt.invalid_unwind_entries, 0);
+        assert_eq!(get_u32(&rebuilt.bytes, optional + 112 + 3 * 8 + 4), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn marks_an_image_with_a_com_descriptor_as_managed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let optional = 0x98;
+        let native = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        )?;
+        put_u32(&mut memory, optional + 112 + 14 * 8, 0x1000);
+        put_u32(&mut memory, optional + 112 + 14 * 8 + 4, 0x48);
+        let managed = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        )?;
+
+        assert!(!native.managed);
+        assert!(managed.managed);
         Ok(())
     }
 

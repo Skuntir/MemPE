@@ -5,6 +5,29 @@ use crate::{AppError, AppResult};
 
 pub(super) const EXCEPTION_DIRECTORY: usize = 3;
 pub(super) const RUNTIME_FUNCTION_SIZE: usize = 12;
+const COM_DESCRIPTOR_DIRECTORY: usize = 14;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum UnwindLayout {
+    Native,
+    Managed,
+}
+
+impl UnwindLayout {
+    pub(super) fn is_managed(self) -> bool {
+        self == Self::Managed
+    }
+}
+
+pub(super) fn unwind_layout(output: &[u8], model: &PeModel) -> UnwindLayout {
+    let Ok(Some(offset)) = model.directory_offset(COM_DESCRIPTOR_DIRECTORY) else {
+        return UnwindLayout::Native;
+    };
+    match read_u32(output, offset) {
+        Ok(rva) if rva != 0 => UnwindLayout::Managed,
+        _ => UnwindLayout::Native,
+    }
+}
 
 pub(super) fn repair_exception_directory(
     output: &mut [u8],
@@ -71,6 +94,7 @@ fn collect_valid_runtime_functions(
     file_offset: usize,
     size: usize,
 ) -> AppResult<ExceptionScan> {
+    let layout = unwind_layout(output, model);
     let count = size / RUNTIME_FUNCTION_SIZE;
     let mut valid = Vec::<[u8; RUNTIME_FUNCTION_SIZE]>::with_capacity(count);
     let mut invalid = usize::from(!size.is_multiple_of(RUNTIME_FUNCTION_SIZE));
@@ -82,7 +106,7 @@ fn collect_valid_runtime_functions(
             invalid = invalid.saturating_add(count.saturating_sub(index));
             break;
         };
-        if runtime_function_is_valid(output, entry, model, layouts, header_size) {
+        if runtime_function_is_valid(output, entry, model, layouts, header_size, layout) {
             let mut copy = [0u8; RUNTIME_FUNCTION_SIZE];
             copy.copy_from_slice(entry);
             valid.push(copy);
@@ -149,6 +173,7 @@ pub(super) fn runtime_function_is_valid(
     model: &PeModel,
     layouts: &[SectionLayout<'_>],
     header_size: usize,
+    layout: UnwindLayout,
 ) -> bool {
     let Ok(begin) = read_u32(entry, 0) else {
         return false;
@@ -171,7 +196,7 @@ pub(super) fn runtime_function_is_valid(
     let Some(first) = output.get(unwind_offset).copied() else {
         return false;
     };
-    matches!(first & 0x07, 1 | 2)
+    layout == UnwindLayout::Managed || matches!(first & 0x07, 1 | 2)
 }
 
 #[cfg(test)]

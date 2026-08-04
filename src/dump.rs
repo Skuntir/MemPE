@@ -26,6 +26,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) aliased_names: usize,
     pub(crate) declared_iat_slots: usize,
     pub(crate) invalid_pdata_sections: usize,
+    pub(crate) managed: bool,
     pub(crate) renamed_sections: usize,
     pub(crate) tls_callbacks: usize,
     pub(crate) entry_point: u32,
@@ -46,9 +47,17 @@ pub(crate) struct ArtifactInfo {
     pub(crate) raw_region: bool,
     pub(crate) hidden: bool,
     pub(crate) is_main: bool,
+    pub(crate) sidecar: bool,
 }
 
 impl ArtifactInfo {
+    fn sidecar(base: usize) -> Self {
+        let mut info = Self::embedded(base, PeKind::Pe32Plus);
+        info.embedded = false;
+        info.sidecar = true;
+        info
+    }
+
     fn raw(base: usize, unreadable_pages: usize) -> Self {
         let mut info = Self::embedded(base, PeKind::Pe32Plus);
         info.embedded = false;
@@ -71,6 +80,7 @@ impl ArtifactInfo {
             aliased_names: 0,
             declared_iat_slots: 0,
             invalid_pdata_sections: 0,
+            managed: false,
             unresolved_delay: 0,
             ambiguous_imports: 0,
             renamed_sections: 0,
@@ -93,6 +103,7 @@ impl ArtifactInfo {
             raw_region: false,
             hidden: false,
             is_main: false,
+            sidecar: false,
         }
     }
 }
@@ -141,7 +152,14 @@ pub(crate) struct BuildReport {
     main_rebuilt: bool,
     dll_failures: usize,
     export_stats: ExportStats,
+    counts: CaptureCounts,
+    selected_images: Option<usize>,
+}
+
+struct CaptureCounts {
     executable_non_image_allocations: usize,
+    unscanned_non_image_bytes: usize,
+    images_skipped: usize,
     hidden_non_image_images: usize,
     main_image_missing: bool,
 }
@@ -152,10 +170,13 @@ pub(crate) struct DumpOutcome {
     pub(crate) summary: DumpSummary,
     pub(crate) export_stats: ExportStats,
     pub(crate) executable_non_image_allocations: usize,
+    pub(crate) unscanned_non_image_bytes: usize,
+    pub(crate) images_skipped: usize,
     pub(crate) hidden_non_image_images: usize,
     pub(crate) main_rebuilt: bool,
     pub(crate) dll_failures: usize,
     pub(crate) main_image_missing: bool,
+    pub(crate) selected_images: Option<usize>,
 }
 
 impl BuildReport {
@@ -167,18 +188,24 @@ impl BuildReport {
             failures: self.failures,
             summary,
             export_stats: self.export_stats,
-            executable_non_image_allocations: self.executable_non_image_allocations,
-            hidden_non_image_images: self.hidden_non_image_images,
+            executable_non_image_allocations: self.counts.executable_non_image_allocations,
+            unscanned_non_image_bytes: self.counts.unscanned_non_image_bytes,
+            images_skipped: self.counts.images_skipped,
+            hidden_non_image_images: self.counts.hidden_non_image_images,
             main_rebuilt: self.main_rebuilt,
             dll_failures: self.dll_failures,
-            main_image_missing: self.main_image_missing,
+            main_image_missing: self.counts.main_image_missing,
+            selected_images: self.selected_images,
         })
     }
 }
 
 impl DumpOutcome {
     pub(crate) fn is_complete(&self) -> bool {
-        self.main_rebuilt && self.dll_failures == 0 && !self.main_image_missing
+        match self.selected_images {
+            Some(selected) => selected > 0 && self.failures.is_empty(),
+            None => self.main_rebuilt && self.dll_failures == 0 && !self.main_image_missing,
+        }
     }
 
     pub(crate) fn has_warnings(&self) -> bool {
@@ -203,13 +230,17 @@ impl DumpOutcome {
             || !self.failures.is_empty()
             || self.main_image_missing
             || self.executable_non_image_allocations > self.hidden_non_image_images
+            || self.unscanned_non_image_bytes > 0
+            || self.images_skipped > 0
+            || self.summary.aliased_names > 0
+            || self.summary.invalid_pdata_sections > 0
     }
 }
 
 impl DumpSummary {
     fn from_artifacts(artifacts: &[WrittenFile<ArtifactInfo>]) -> Self {
         let mut summary = Self::default();
-        for artifact in artifacts {
+        for artifact in artifacts.iter().filter(|entry| !entry.context.sidecar) {
             summary.add(&artifact.context);
         }
         summary
@@ -284,14 +315,31 @@ impl DumpSummary {
     }
 }
 
+fn image_matches(image: &CapturedImage, want: &str) -> bool {
+    if let Some(text) = want.strip_prefix("0x").or_else(|| want.strip_prefix("0X"))
+        && let Ok(base) = usize::from_str_radix(text, 16)
+    {
+        return image.base == base;
+    }
+    image
+        .name
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(want))
+}
+
 pub(crate) fn build(
     target: &TargetProcess,
     capture: Capture,
     entry_point: Option<EntryPointRva>,
+    only: Option<&str>,
 ) -> BuildReport {
-    let executable_non_image_allocations = capture.executable_non_image_allocations;
-    let main_image_missing = capture.main_image_missing;
-    let hidden_non_image_images = capture.images.iter().filter(|image| image.hidden).count();
+    let counts = CaptureCounts {
+        executable_non_image_allocations: capture.executable_non_image_allocations,
+        unscanned_non_image_bytes: capture.unscanned_non_image_bytes,
+        images_skipped: capture.images_skipped,
+        hidden_non_image_images: capture.images.iter().filter(|image| image.hidden).count(),
+        main_image_missing: capture.main_image_missing,
+    };
     let carve_regions = capture.carve_regions;
     let raw_regions = capture.raw_regions;
     let mut images = capture.images;
@@ -303,25 +351,25 @@ pub(crate) fn build(
             .map(|image| (image.base, image.bytes.as_slice(), image.name.as_deref())),
     );
     let export_stats = exports.stats();
-    let mut report = empty_report(
-        target,
-        &images,
-        export_stats,
-        executable_non_image_allocations,
-        hidden_non_image_images,
-        main_image_missing,
-    );
+    let mut report = empty_report(target, &images, export_stats, counts);
     if entry_point.is_some() && !images.iter().any(|image| image.is_main) {
         report.failures.push(BuildFailure {
             name: target.name.clone(),
-            base: target.main_module.base,
+            base: target.main_module.as_ref().map_or(0, |module| module.base),
             error: AppError::new("manual entry point requires a captured main image"),
         });
         return report;
     }
-    push_region_embedded(&carve_regions, &mut report);
+    if only.is_none() {
+        push_region_embedded(&carve_regions, &mut report);
+    }
     push_raw_regions(&raw_regions, &mut report);
+    let mut selected = 0usize;
     for image in images {
+        if only.is_some_and(|want| !image_matches(&image, want)) {
+            continue;
+        }
+        selected = selected.saturating_add(1);
         push_embedded(target, &image, &mut report);
         let validates_manual_entry_point = image.is_main && entry_point.is_some();
         build_image(target, image, &exports, entry_point, &mut report);
@@ -329,6 +377,7 @@ pub(crate) fn build(
             break;
         }
     }
+    report.selected_images = only.map(|_| selected);
     report
 }
 
@@ -362,12 +411,42 @@ fn push_raw_regions(regions: &[RawRegion], report: &mut BuildReport) {
             continue;
         }
         bytes.extend_from_slice(&region.bytes);
+        let stem = format!("region.{:016X}.{:X}", region.base, bytes.len());
+        let notes = region_notes(region, bytes.len());
         report.files.push(OutputFile {
-            preferred_name: format!("region.{:016X}.{:X}.raw", region.base, bytes.len()),
+            preferred_name: format!("{stem}.raw"),
             bytes,
             context: ArtifactInfo::raw(region.base, region.unreadable_pages),
         });
+        report.files.push(OutputFile {
+            preferred_name: format!("{stem}.txt"),
+            bytes: notes.into_bytes(),
+            context: ArtifactInfo::sidecar(region.base),
+        });
     }
+}
+
+fn region_notes(region: &RawRegion, written: usize) -> String {
+    format!(
+        "load address        0x{:016X}\n\
+         allocation base     0x{:016X}\n\
+         bytes written       0x{written:X} ({written} bytes)\n\
+         committed           0x{:X} ({} bytes)\n\
+         protections         0x{:08X}, the union across every committed page\n\
+         any page executable {}\n\
+         unreadable          {} pages, zero-filled\n\
+         \n\
+         These are raw bytes with no PE structure. mempe does not invent a header\n\
+         for them. Point a disassembler at the load address above. Protections are\n\
+         a union, so individual pages inside this range may be less permissive.\n",
+        region.base,
+        region.base,
+        region.committed,
+        region.committed,
+        region.protections,
+        if region.executable { "yes" } else { "no" },
+        region.unreadable_pages,
+    )
 }
 
 fn push_embedded(target: &TargetProcess, image: &CapturedImage, report: &mut BuildReport) {
@@ -427,16 +506,15 @@ fn empty_report(
     target: &TargetProcess,
     images: &[CapturedImage],
     export_stats: ExportStats,
-    executable_non_image_allocations: usize,
-    hidden_non_image_images: usize,
-    main_image_missing: bool,
+    counts: CaptureCounts,
 ) -> BuildReport {
     let captured_bases = images.iter().map(|image| image.base).collect::<Vec<_>>();
     let dll_failures = target
         .modules
         .iter()
         .filter(|module| {
-            module.base != target.main_module.base && !captured_bases.contains(&module.base)
+            Some(module.base) != target.main_module.as_ref().map(|main| main.base)
+                && !captured_bases.contains(&module.base)
         })
         .count();
     BuildReport {
@@ -445,9 +523,8 @@ fn empty_report(
         main_rebuilt: false,
         dll_failures,
         export_stats,
-        executable_non_image_allocations,
-        hidden_non_image_images,
-        main_image_missing,
+        counts,
+        selected_images: None,
     }
 }
 
@@ -494,6 +571,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         aliased_names: rebuilt.aliased_names,
         declared_iat_slots: rebuilt.declared_iat_slots,
         invalid_pdata_sections: rebuilt.invalid_pdata_sections,
+        managed: rebuilt.managed,
         unresolved_delay: rebuilt.unresolved_delay,
         ambiguous_imports: rebuilt.ambiguous_imports,
         renamed_sections: rebuilt.renamed_sections,
@@ -516,6 +594,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         embedded: false,
         hidden: image.hidden,
         is_main: image.is_main,
+        sidecar: false,
     }
 }
 
@@ -641,9 +720,34 @@ fn with_extension(name: &str, extension: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{ArtifactInfo, DumpSummary};
+    use super::{ArtifactInfo, DumpOutcome, DumpSummary};
     use crate::output::WrittenFile;
-    use crate::pe::PeKind;
+    use crate::pe::{ExportStats, PeKind};
+
+    fn outcome(selected_images: Option<usize>, main_rebuilt: bool) -> DumpOutcome {
+        DumpOutcome {
+            artifacts: Vec::new(),
+            failures: Vec::new(),
+            summary: DumpSummary::default(),
+            export_stats: ExportStats::default(),
+            executable_non_image_allocations: 0,
+            unscanned_non_image_bytes: 0,
+            images_skipped: 0,
+            hidden_non_image_images: 0,
+            main_rebuilt,
+            dll_failures: 0,
+            main_image_missing: false,
+            selected_images,
+        }
+    }
+
+    #[test]
+    fn a_filtered_dump_is_complete_only_when_the_filter_matched_something() {
+        assert!(!outcome(Some(0), false).is_complete());
+        assert!(outcome(Some(1), false).is_complete());
+        assert!(!outcome(None, false).is_complete());
+        assert!(outcome(None, true).is_complete());
+    }
 
     fn artifact(is_main: bool, hidden: bool, imports: usize) -> WrittenFile<ArtifactInfo> {
         WrittenFile {
@@ -661,6 +765,7 @@ mod tests {
                 aliased_names: 0,
                 declared_iat_slots: 0,
                 invalid_pdata_sections: 0,
+                managed: false,
                 unresolved_delay: 0,
                 ambiguous_imports: 0,
                 renamed_sections: 1,
@@ -683,6 +788,7 @@ mod tests {
                 raw_region: false,
                 hidden,
                 is_main,
+                sidecar: false,
             },
         }
     }

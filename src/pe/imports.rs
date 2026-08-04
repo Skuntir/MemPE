@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::pe::exports::{ExportIndex, ResolvedExport};
+use crate::pe::exports::{ExportIndex, ResolvedExport, embedded_module_name};
 use crate::pe::image;
 use crate::pe::{
     IAT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
@@ -38,6 +38,12 @@ const MOV_LOAD_OPCODE: u8 = 0x8B;
 const MODRM_RIP_MASK: u8 = 0xC7;
 const MODRM_RIP_VALUE: u8 = 0x05;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Reference {
+    Called,
+    Loaded,
+}
+
 pub(super) struct ImportEntry {
     pub(super) name: Option<String>,
     pub(super) ordinal: u32,
@@ -57,6 +63,7 @@ pub(super) struct ImportPlan {
     pub(super) aliased_names: usize,
     pub(super) unresolved_delay: usize,
     pub(super) existing: Vec<u8>,
+    own: Option<String>,
 }
 
 pub(super) fn build_plan(
@@ -64,7 +71,10 @@ pub(super) fn build_plan(
     observed_base: usize,
     exports: &ExportIndex,
 ) -> ImportPlan {
-    let mut plan = ImportPlan::default();
+    let mut plan = ImportPlan {
+        own: embedded_module_name(image.bytes()),
+        ..ImportPlan::default()
+    };
     match existing_descriptors(image).or_else(|| scan_for_orphaned_descriptors(image)) {
         Some(existing) => plan.existing = existing,
         None => scan_trusted_ranges(image, observed_base, exports, &mut plan),
@@ -339,7 +349,7 @@ fn recover_referenced_imports(
     let remaining = MAX_IMPORTS.saturating_sub(plan.recovered);
     let mut entries = Vec::with_capacity(referenced.len().min(remaining));
 
-    for slot in referenced {
+    for (slot, reference) in referenced {
         if recovered.contains(&slot)
             || !slot_is_in_data_section(image, slot, width)
             || entries.len() >= remaining
@@ -358,6 +368,11 @@ fn recover_referenced_imports(
             plan.ambiguous = plan.ambiguous.saturating_add(1);
             continue;
         }
+        if reference == Reference::Loaded
+            && !neighbor_shares_module(memory, observed_base, kind, exports, slot, &symbol.module)
+        {
+            continue;
+        }
         if aliased {
             plan.aliased_names = plan.aliased_names.saturating_add(1);
         }
@@ -367,10 +382,28 @@ fn recover_referenced_imports(
     append_groups(entries, width, 1, plan);
 }
 
-fn find_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeSet<u32> {
+fn neighbor_shares_module(
+    memory: &[u8],
+    observed_base: usize,
+    kind: PeKind,
+    exports: &ExportIndex,
+    slot: u32,
+    module: &str,
+) -> bool {
+    let width = kind.pointer_width();
+    let step = width as u32;
+    [slot.checked_sub(step), slot.checked_add(step)]
+        .into_iter()
+        .flatten()
+        .filter_map(|neighbor| read_pointer(memory, neighbor as usize, width))
+        .filter_map(|value| resolve_value(memory, observed_base, kind, value, exports))
+        .any(|(symbol, _, _)| symbol.module.eq_ignore_ascii_case(module))
+}
+
+fn find_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeMap<u32, Reference> {
     let memory = image.bytes();
     let model = image.model();
-    let mut slots = BTreeSet::new();
+    let mut slots = BTreeMap::new();
     let mut scanned = 0usize;
     for section in model.sections() {
         if !section.is_executable() || scanned >= MAX_CODE_REFERENCE_BYTES {
@@ -387,10 +420,13 @@ fn find_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeSet<
         let scan_length = code.len().min(remaining);
         for index in 0..scan_length.saturating_sub(5) {
             let instruction = start.saturating_add(index);
-            if let Some(slot) =
+            if let Some((slot, reference)) =
                 decode_slot_reference(memory, observed_base, model.kind(), instruction)
             {
-                slots.insert(slot);
+                let seen = slots.entry(slot).or_insert(reference);
+                if reference == Reference::Called {
+                    *seen = Reference::Called;
+                }
                 if slots.len() >= MAX_IMPORTS {
                     return slots;
                 }
@@ -406,13 +442,13 @@ fn decode_slot_reference(
     observed_base: usize,
     kind: PeKind,
     instruction: usize,
-) -> Option<u32> {
+) -> Option<(u32, Reference)> {
     if let Some(code) = memory.get(instruction..instruction.checked_add(CALL_JUMP_LENGTH)?)
         && code[0] == CALL_JUMP_PREFIX
         && matches!(code[1], CALL_MODRM | JUMP_MODRM)
     {
         let operand = u32::from_le_bytes([code[2], code[3], code[4], code[5]]);
-        return match kind {
+        let slot = match kind {
             PeKind::Pe32 => {
                 u32::try_from(usize::try_from(operand).ok()?.checked_sub(observed_base)?).ok()
             }
@@ -420,6 +456,7 @@ fn decode_slot_reference(
                 rip_relative_slot(observed_base, instruction, CALL_JUMP_LENGTH, operand as i32)
             }
         };
+        return Some((slot?, Reference::Called));
     }
     if kind != PeKind::Pe32Plus {
         return None;
@@ -432,7 +469,8 @@ fn decode_slot_reference(
         return None;
     }
     let displacement = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);
-    rip_relative_slot(observed_base, instruction, MOV_LOAD_LENGTH, displacement)
+    let slot = rip_relative_slot(observed_base, instruction, MOV_LOAD_LENGTH, displacement)?;
+    Some((slot, Reference::Loaded))
 }
 
 fn rip_relative_slot(
@@ -524,6 +562,13 @@ fn append_groups(
 ) {
     let mut current: Option<ImportGroup> = None;
     for (slot, symbol) in entries {
+        if plan
+            .own
+            .as_deref()
+            .is_some_and(|own| own.eq_ignore_ascii_case(&symbol.module))
+        {
+            continue;
+        }
         let same_module = current.as_ref().is_some_and(|group| {
             group.module.eq_ignore_ascii_case(&symbol.module)
                 && group
@@ -790,7 +835,7 @@ mod tests {
     use pelite::PeFile;
 
     use super::{
-        IMPORT_DESCRIPTOR_SIZE, build_plan, decode_slot_reference, delay_table_range,
+        IMPORT_DESCRIPTOR_SIZE, Reference, build_plan, decode_slot_reference, delay_table_range,
         rip_relative_slot, try_descriptor_array,
     };
     use crate::pe::parse::parse_memory_image;
@@ -955,7 +1000,65 @@ mod tests {
 
         let slot = decode_slot_reference(&code, base, PeKind::Pe32, 0);
 
-        assert_eq!(slot, Some(0x2000));
+        assert_eq!(slot, Some((0x2000, Reference::Called)));
+    }
+
+    #[test]
+    fn ignores_a_loaded_pointer_standing_alone_among_unrelated_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = plain_data_fixture();
+        target[0x1000..0x1007].copy_from_slice(&[0x48, 0x8B, 0x05, 0xF9, 0x11, 0x00, 0x00]);
+        put_u64(&mut target, 0x2200, export_base as u64 + 0x1000);
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
+
+        assert_eq!(plan.recovered, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_a_loaded_pointer_beside_a_slot_from_the_same_module()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = plain_data_fixture();
+        target[0x1000..0x1007].copy_from_slice(&[0x48, 0x8B, 0x05, 0xF9, 0x11, 0x00, 0x00]);
+        put_u64(&mut target, 0x2200, export_base as u64 + 0x1000);
+        put_u64(&mut target, 0x2208, export_base as u64 + 0x1010);
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
+
+        assert_eq!(plan.recovered, 1);
+        assert_eq!(plan.groups[0].module, "fixture.dll");
+        Ok(())
+    }
+
+    #[test]
+    fn never_records_an_image_as_importing_from_itself() -> Result<(), Box<dyn std::error::Error>> {
+        let target_base = 0x0000_7FF6_0000_0000usize;
+        let mut target = fixture_pe64(true);
+        put_u64(&mut target, 0x2100, target_base as u64 + 0x1000);
+        put_u64(&mut target, 0x2108, target_base as u64 + 0x1010);
+        let index = ExportIndex::build([(target_base, target.as_slice(), None)]);
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, target_base, &index);
+
+        assert_eq!(plan.recovered, 0);
+        assert!(plan.groups.is_empty());
+        Ok(())
+    }
+
+    fn plain_data_fixture() -> Vec<u8> {
+        let mut image = fixture_pe64(false);
+        image[0x1B0..0x1B8].copy_from_slice(b".rdata\0\0");
+        image
     }
 
     fn fixture_pe64(with_exports: bool) -> Vec<u8> {
@@ -1046,19 +1149,19 @@ mod tests {
 
         assert_eq!(
             decode_slot_reference(&call, 0, PeKind::Pe32Plus, 0),
-            Some(0x106)
+            Some((0x106, Reference::Called))
         );
         assert_eq!(
             decode_slot_reference(&jump, 0, PeKind::Pe32Plus, 0),
-            Some(0x106)
+            Some((0x106, Reference::Called))
         );
         assert_eq!(
             decode_slot_reference(&mov_rax, 0, PeKind::Pe32Plus, 0),
-            Some(0x107)
+            Some((0x107, Reference::Loaded))
         );
         assert_eq!(
             decode_slot_reference(&mov_r9, 0, PeKind::Pe32Plus, 0),
-            Some(0x107)
+            Some((0x107, Reference::Loaded))
         );
     }
 

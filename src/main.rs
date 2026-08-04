@@ -58,6 +58,7 @@ fn run(console: &Console, request: Request) -> ExitCode {
         command,
         entry_point,
         raw_regions,
+        only,
     } = request;
     let watched = matches!(&command, Command::Watch(_));
     let output = match output::prepare() {
@@ -101,7 +102,14 @@ fn run(console: &Console, request: Request) -> ExitCode {
     }
     console.blank();
 
-    finish_dump(console, &output, &target, capture, entry_point)
+    finish_dump(
+        console,
+        &output,
+        &target,
+        capture,
+        entry_point,
+        only.as_deref(),
+    )
 }
 
 fn render_target(console: &Console, target: &TargetProcess) {
@@ -109,14 +117,18 @@ fn render_target(console: &Console, target: &TargetProcess) {
     console.field("Name", format_args!("{}", target.name));
     console.field("PID", format_args!("{}", target.pid.get()));
     console.field("Arch", format_args!("{}", target.architecture));
-    console.field(
-        "Image",
-        format_args!(
-            "0x{:016X} ({})",
-            target.main_module.base,
-            format_size(target.main_module.size)
+    match &target.main_module {
+        Some(module) => console.field(
+            "Image",
+            format_args!("0x{:016X} ({})", module.base, format_size(module.size)),
         ),
-    );
+        None => console.field("Image", format_args!("resolved during capture")),
+    }
+    if target.module_listing_denied {
+        console.warning(format_args!(
+            "Module enumeration was denied, so image names come from mapped files, not the loader"
+        ));
+    }
     console.blank();
 }
 
@@ -140,8 +152,9 @@ fn finish_dump(
     target: &TargetProcess,
     capture: memory::Capture,
     entry_point: Option<pe::EntryPointRva>,
+    only: Option<&str>,
 ) -> ExitCode {
-    let outcome = match dump::build(target, capture, entry_point).write(output) {
+    let outcome = match dump::build(target, capture, entry_point, only).write(output) {
         Ok(outcome) => outcome,
         Err(error) => {
             console.error(format_args!("Could not write mempe: {error}"));
@@ -156,10 +169,15 @@ fn finish_dump(
         console.done(format_args!("Analysis-ready memory images"));
         ExitCode::SUCCESS
     } else {
-        console.partial(format_args!(
-            "Main rebuilt: {}; DLL failures: {}",
-            outcome.main_rebuilt, outcome.dll_failures
-        ));
+        match outcome.selected_images {
+            Some(0) => console.partial(format_args!(
+                "No captured image matched the requested name or base address"
+            )),
+            _ => console.partial(format_args!(
+                "Main rebuilt: {}; DLL failures: {}",
+                outcome.main_rebuilt, outcome.dll_failures
+            )),
+        }
         ExitCode::from(3)
     }
 }
@@ -216,6 +234,14 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
             unwind_note(main.context.entry_unwind_covered)
         ),
     );
+    if main.context.managed {
+        console.field(
+            "Managed",
+            format_args!(
+                "CLR image; the code is IL, so a native capture reproduces the mapped file"
+            ),
+        );
+    }
     if main.context.declared_iat_slots > 0 {
         console.field(
             "IAT",
@@ -277,7 +303,10 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
     }
     console.field(
         "TLS",
-        format_args!("{} callbacks", outcome.summary.tls_callbacks),
+        format_args!(
+            "{} callbacks across {} images",
+            outcome.summary.tls_callbacks, outcome.summary.rebuilt_images
+        ),
     );
     console.field(
         "Non-image",
@@ -302,6 +331,18 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
     render_repair_warnings(console, outcome);
     render_import_warnings(console, outcome);
     render_build_failures(console, outcome);
+    if outcome.images_skipped > 0 {
+        console.warning(format_args!(
+            "Images skipped for the memory budget: {}",
+            outcome.images_skipped
+        ));
+    }
+    if outcome.unscanned_non_image_bytes > 0 {
+        console.warning(format_args!(
+            "Non-image memory left unscanned for embedded PEs: {}",
+            format_size(outcome.unscanned_non_image_bytes)
+        ));
+    }
     let unmatched_non_image = outcome
         .executable_non_image_allocations
         .saturating_sub(outcome.hidden_non_image_images);
@@ -333,59 +374,59 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
 
 fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 15] {
     [
-        (summary.unreadable_pages, "Unreadable pages zero-filled"),
-        (
-            summary.cleared_directories,
-            "Invalid or file-only directories cleared",
-        ),
-        (
-            summary.executable_flags_added,
-            "Images given a missing IMAGE_FILE_EXECUTABLE_IMAGE flag",
-        ),
-        (summary.repaired_headers, "Damaged PE headers repaired"),
-        (
-            summary.disk_header_repairs,
-            "Images rebuilt with disk headers, section data from memory",
-        ),
-        (
-            summary.renamed_sections,
-            "Unreadable section names replaced",
-        ),
-        (
-            summary.repaired_debug_entries,
-            "Debug entries repointed at the rebuilt layout",
-        ),
-        (
-            summary.fixed_image_bases,
-            "Images that lost ASLR because they have no relocations",
-        ),
-        (
-            summary.unlinked_images,
-            "Mapped images missing from the loader module list",
-        ),
         (
             summary.never_decrypted_sections,
             "High-entropy sections never written after loading, so mempe's copy may still be encrypted",
-        ),
-        (
-            summary.raw_region_unreadable_pages,
-            "Unreadable pages zero-filled inside raw regions",
         ),
         (
             summary.absent_sections,
             "Executable sections that are entirely zero in the dump, so their real content was never captured",
         ),
         (
+            summary.invalid_pdata_sections,
+            "Sections named .pdata that hold no valid runtime-function table, so their contents are not real",
+        ),
+        (summary.unreadable_pages, "Unreadable pages zero-filled"),
+        (
+            summary.raw_region_unreadable_pages,
+            "Unreadable pages zero-filled inside raw regions",
+        ),
+        (
             summary.path_mismatches,
             "Images mapped from a different file than the loader reports",
         ),
         (
-            summary.invalid_pdata_sections,
-            "Sections named .pdata that hold no valid runtime-function table, so their contents are not real",
+            summary.disk_header_repairs,
+            "Images rebuilt with disk headers, section data from memory",
+        ),
+        (summary.repaired_headers, "Damaged PE headers repaired"),
+        (
+            summary.unlinked_images,
+            "Mapped images missing from the loader module list",
+        ),
+        (
+            summary.fixed_image_bases,
+            "Images that lost ASLR because they have no relocations",
         ),
         (
             summary.aliased_names,
             "Import names picked from several equally valid export aliases",
+        ),
+        (
+            summary.cleared_directories,
+            "Invalid or file-only directories cleared",
+        ),
+        (
+            summary.repaired_debug_entries,
+            "Debug entries repointed at the rebuilt layout",
+        ),
+        (
+            summary.renamed_sections,
+            "Unreadable section names replaced",
+        ),
+        (
+            summary.executable_flags_added,
+            "Images given a missing IMAGE_FILE_EXECUTABLE_IMAGE flag",
         ),
     ]
 }

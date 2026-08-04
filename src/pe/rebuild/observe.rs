@@ -1,4 +1,6 @@
-use super::exception::{EXCEPTION_DIRECTORY, RUNTIME_FUNCTION_SIZE, runtime_function_is_valid};
+use super::exception::{
+    EXCEPTION_DIRECTORY, RUNTIME_FUNCTION_SIZE, runtime_function_is_valid, unwind_layout,
+};
 use super::sections::readable_section_name;
 use super::{PAGE_SIZE, SectionLayout};
 use crate::pe::image::{read_pointer, read_u32};
@@ -129,6 +131,7 @@ fn unwind_table_is_bogus(
     if layout.raw_size == 0 {
         return false;
     }
+    let unwind = unwind_layout(output, model);
     let count = (layout.source_length / RUNTIME_FUNCTION_SIZE).min(MAX_PDATA_ENTRIES);
     let mut invalid = 0usize;
     for index in 0..count {
@@ -138,7 +141,7 @@ fn unwind_table_is_bogus(
         let Some(entry) = output.get(offset..offset.saturating_add(RUNTIME_FUNCTION_SIZE)) else {
             break;
         };
-        if !runtime_function_is_valid(output, entry, model, layouts, header_size) {
+        if !runtime_function_is_valid(output, entry, model, layouts, header_size, unwind) {
             invalid = invalid.saturating_add(1);
         }
     }

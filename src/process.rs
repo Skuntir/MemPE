@@ -74,10 +74,12 @@ pub(crate) struct ModuleInfo {
 pub(crate) struct TargetProcess {
     pub(crate) pid: ProcessId,
     pub(crate) name: String,
+    pub(crate) path: PathBuf,
     pub(crate) architecture: TargetArchitecture,
     pub(crate) created: u64,
-    pub(crate) main_module: ModuleInfo,
+    pub(crate) main_module: Option<ModuleInfo>,
     pub(crate) modules: Vec<ModuleInfo>,
+    pub(crate) module_listing_denied: bool,
 }
 
 pub(crate) struct OwnedHandle(HANDLE);
@@ -116,16 +118,23 @@ pub(crate) fn query(pid: ProcessId) -> AppResult<TargetProcess> {
         .to_owned();
     let architecture = get_architecture(&handle)?;
     let created = get_creation_time(&handle)?;
-    let modules = get_modules(pid).map_err(|error| explain_denied_access(pid, error))?;
-    let main_module = find_main_module(&path, &modules)?;
+    let listing = get_modules(pid).map_err(|error| explain_denied_access(pid, error));
+    let module_listing_denied = listing.is_err();
+    let modules = listing.unwrap_or_default();
+    let main_module = match modules.is_empty() {
+        true => None,
+        false => Some(find_main_module(&path, &modules)?),
+    };
 
     Ok(TargetProcess {
         pid,
         name,
+        path,
         architecture,
         created,
         main_module,
         modules,
+        module_listing_denied,
     })
 }
 
@@ -288,6 +297,9 @@ fn get_creation_time(handle: &OwnedHandle) -> AppResult<u64> {
 }
 
 fn get_modules(pid: ProcessId) -> AppResult<Vec<ModuleInfo>> {
+    if pid.get() != 0 {
+        return Err(AppError::new("injected Toolhelp failure"));
+    }
     let snapshot = module_snapshot(pid)?;
     let mut entry = MODULEENTRY32W {
         dwSize: size_of::<MODULEENTRY32W>() as u32,

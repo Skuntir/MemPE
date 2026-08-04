@@ -26,6 +26,8 @@ Use it for reverse engineering and unpacking. mempe is a dumper, not a malware s
 - Clears directories that no longer point to valid data and removes broken x64 unwind entries
 - Reports what it observed about the entry point and about sections it may not have captured in a decrypted state
 - Zero-fills unreadable pages and reports them in the final summary
+- Orders warnings so the ones that mean the dump may be wrong come before the cosmetic ones
+- Reports how much non-image memory the embedded-PE scan had to leave unread, so an empty carve result is distinguishable from an incomplete one
 
 ## Usage
 
@@ -63,7 +65,16 @@ Also write the raw bytes of executable memory that held no complete PE:
 mempe.exe -p 4216 --raw-regions
 ```
 
-This is off by default because it can add a lot of files. Use it when you are looking for headerless payloads or shellcode that the PE carver will not pick up.
+This is off by default because it can add a lot of files. Use it when you are looking for headerless payloads or shellcode that the PE carver will not pick up. Each region is written twice: the untouched bytes as `.raw`, and a `.txt` next to it recording the load address, allocation base, committed size, page protection and whether the region was executable, so you can point a disassembler at the right address. No header is invented for those bytes.
+
+Write only the images you care about:
+
+```text
+mempe.exe -p 4216 --only explorer.exe
+mempe.exe -p 4216 --only 0x00007FF611EA0000
+```
+
+Every image is still captured and indexed, so imports resolve exactly as they would in a full dump; only the files written are filtered. Dumping explorer writes 389 files by default and one with `--only`.
 
 Show the built-in help:
 
@@ -81,7 +92,7 @@ Working-set page state is measured first, in `measure_image_pages`, before anyth
 
 `AddressSpace::acquire` then takes a `PSS_CAPTURE_VA_CLONE` snapshot, falling back to a plain live read if that fails. `list_regions` walks the address space, `group_images` collects regions into images by allocation base, and `read_image` copies each image's committed regions into a buffer, zero-filling anything unreadable and recording what protections each region actually had. `find_hidden_images` looks for page-aligned PE headers inside executable non-image allocations, and `read_allocations` picks up readable non-image memory so the carver can search it later.
 
-**2. Rebuild** (`src/pe/rebuild.rs`, one image at a time)
+**2. Rebuild** (`src/pe/rebuild/`, one image at a time)
 
 `resolve_source_bytes` decides which bytes to work from. It parses the captured headers; if `e_lfanew` is unusable, `parse_memory_image` brute-force scans for an NT signature before giving up. Only if that fails does mempe read the original file from disk and splice its headers on, and only when the memory at that base is still image-backed and the mapped file still matches the name the loader reported. Either way, `recover_section_headers` then repairs the section table from the region evidence gathered during capture. That last step does most of the work for packed images, whose section headers often claim a raw size of zero.
 
@@ -144,9 +155,13 @@ mempe needs permission to open and read the target process. An elevated target m
 
 - Import recovery depends on the IAT and on the exports available in the captured process. Packed files, custom loaders, API hashing, and unusual thunk layouts may leave imports unresolved.
 - A delay-load slot that has never been called still points at its own stub, so its target cannot be recovered. mempe counts those slots and reports them separately rather than dropping them silently.
-- Hidden images are found by looking for page-aligned PE headers. Headerless payloads and raw shellcode are only written with `--raw-regions`, and then as plain bytes with no reconstructed header.
+- Hidden images are found by looking for page-aligned PE headers. Headerless payloads and raw shellcode are only written with `--raw-regions`, and then as plain bytes with no reconstructed header, alongside a sidecar recording where they were mapped.
+- Import recovery through a `mov r64,[rip+disp32]` requires a neighbouring pointer slot resolving into the same module, because a lone cached pointer to an API is not a link-time dependency. Pointers reached through `call` or `jmp` are accepted without that check. Runtime dispatch tables, such as the `gdi32.dll` thunks into `gdi32full.dll`, are still recorded as imports: they are real pointers to real exports, and separating them from genuine imports would need a hardcoded list of Windows shim relationships.
+- If module enumeration is denied, mempe still dumps. Image names then come from mapped files rather than the loader, the main image is identified by its mapped path, and the degraded mode is reported.
+- Capture stops at 4096 images or 4 GiB of image data. Hitting either truncates the dump and reports the number of images skipped instead of failing; the main image is always captured.
 - Unreadable memory is replaced with zeroes. The warning count tells you how much data was lost.
-- The entropy warning only fires on sections that are resident and unwritten. A section that was never faulted in at all is reported by the separate all-zero warning instead.
+- The entropy warning fires on any section that is resident and was never written after loading, whatever its type. A section that was never faulted in at all is reported by the separate all-zero warning, and a `.pdata` section holding something other than a runtime-function table is reported by a third.
+- The embedded-PE scan stops after 256 MiB of non-image memory. Anything past that is left unread and the amount is reported, so an empty carve result can be told apart from a truncated one.
 - If the main image has been unmapped from the target, mempe dumps every other module and reports the missing main image rather than failing outright. The result is a partial dump and exit code 3.
 - A structurally valid PE is useful for static analysis, but it may still need manual work before it can run.
 - Only x86 and x64 Windows PE images are supported.
